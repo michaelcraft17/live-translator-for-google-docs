@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>GDT mock Google Docs page</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        font-family: Arial, sans-serif;
+        background: #f8f9fa;
+        min-width: 1300px; /* leave room on the right for the sidebar */
+      }
+
+      #docs-chrome {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 120px;
+        background: #fff;
+        border-bottom: 1px solid #ccc;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        padding: 0 24px;
+        font-weight: bold;
+        color: #444;
+      }
+
+      .kix-appview-editor-container {
+        margin-top: 120px;
+        padding: 40px 0 200px;
+        display: flex;
+        justify-content: center;
+      }
+
+      /*
+       * Stand-in for the real `.kix-page-paginated` box content.js anchors
+       * its measurement mirror to. On a real doc this is a real element
+       * whose *content* is canvas (no DOM text) — reproduced here the same
+       * way: a fixed-size box with no real text DOM, just a faint label
+       * (via ::before, in normal flow only so this box has a realistic
+       * size) standing in for what a human would see painted on canvas.
+       * The label plays no role in extraction/highlighting — that all
+       * comes from content.js's own mirror, built from
+       * window.__GDT_MOCK_EXPORT_HTML__ (see mock-hooks.js), positioned
+       * over this box via .kix-page-paginated's real getBoundingClientRect.
+       */
+      .kix-page-paginated {
+        position: relative;
+        width: 816px;
+        min-height: 400px;
+        background: #fff;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+        padding: 96px;
+        box-sizing: border-box;
+        color: #333;
+        font-size: 14.67px; /* 11pt * 4/3 px-per-pt, matching the mock export's .c1 */
+        line-height: 1.15;
+      }
+      .kix-page-paginated p {
+        margin: 0 0 4px;
+      }
+
+      #gdt-test-debug {
+        margin: 40px auto;
+        max-width: 816px;
+      }
+      #gdt-test-debug button {
+        padding: 6px 14px;
+        cursor: pointer;
+      }
+      #gdt-test-dump {
+        background: #1e1e1e;
+        color: #d4d4d4;
+        padding: 12px;
+        border-radius: 6px;
+        font-size: 12px;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="docs-chrome">Mock Docs toolbar (stand-in for #docs-chrome)</div>
+
+    <div class="kix-appview-editor kix-appview-editor-container">
+      <div class="kix-page-paginated">
+        <p>Copy of Yeast as a model organism for studying neurodegenerative diseases</p>
+        <p>[table row] Name · Michael Chang · Date · 9/4/2026 · Class Period · 4</p>
+        <p>Yeast as a model organism for studying neurodegenerative disease</p>
+        <p>
+          Humans have enjoyed a close association with yeast for thousands of years, using the
+          organism to make bread and beer. The desire of brewers to make higher quality beer led to
+          the first genetic manipulation of yeast cells. Today, yeast is one of the best-studied
+          genetic organisms with a small, well-defined genome (one of the first sequenced), and
+          powerful tools are available for manipulating it. Research using yeast has shed light on
+          the steps of the cell cycle, leading to a greater understanding of cancer biology. But is
+          this unicellular organism that lacks a brain, or even a dendrite, a good model organism for
+          understanding Neurodegenerative Diseases?
+        </p>
+        <p>Resources:</p>
+      </div>
+    </div>
+
+    <div id="gdt-test-debug">
+      <button id="gdt-dump-btn" type="button">Dump extension state</button>
+      <pre id="gdt-test-dump">(click the button after the page finishes loading/translating)</pre>
+    </div>
+
+    <!--
+      Extension pages enforce Manifest V3's default CSP (script-src
+      'self'), which blocks inline <script> blocks — every script here
+      must be an external file from the package.
+    -->
+    <script src="mock-hooks.js"></script>
+
+    <link rel="stylesheet" href="../content/content.css" />
+    <script src="../content/content.js"></script>
+
+    <script src="mock-debug.js"></script>
+  </body>
+</html>

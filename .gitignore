@@ -1,0 +1,7 @@
+# Build output — regenerate with ./package.sh
+dist/
+
+.DS_Store
+
+# Internal engineering handoff — kept locally, deliberately not published.
+HANDOFF.md
