@@ -2827,7 +2827,10 @@
     if (!state.docId) return;
     // No open side panel (or translation switched off) means nobody to show
     // anything to, and every export request counts against the rate limit.
-    if (!state.sidePanelPort || !state.enabled) return;
+    // (The mock page has no side panel to open, so its canned-export hook
+    // stands in for one — see test/mock-docs.html.)
+    const hasAudience = state.sidePanelPort || window.__GDT_MOCK_EXPORT_HTML__ !== undefined;
+    if (!hasAudience || !state.enabled) return;
     // Nobody is looking at this browser tab, so there's nothing to keep
     // current — and every export request counts against the rate limit.
     if (document.hidden) return;
