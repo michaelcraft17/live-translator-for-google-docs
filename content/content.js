@@ -3055,7 +3055,15 @@
     state.floatingBtn = btn;
     placeFloatingButton();
     setInterval(placeFloatingButton, 500);
-    window.addEventListener("resize", debounce(placeFloatingButton, 100));
+    // The panel opening or closing resizes the viewport over a few frames
+    // while Docs reflows its header; follow along immediately and settle
+    // again once things have stopped moving, instead of waiting for the
+    // next tick and jumping.
+    const settleSoon = debounce(placeFloatingButton, 150);
+    window.addEventListener("resize", () => {
+      placeFloatingButton();
+      settleSoon();
+    });
   }
 
   // Docs' header changes shape with its state — with the menus shown there
@@ -3121,6 +3129,11 @@
     }
     btn.style.top = `${top}px`;
     btn.style.left = `${left}px`;
+    // Slide between positions, but not on the very first placement (that
+    // would glide in from the corner).
+    if (!btn.classList.contains("gdt-placed")) {
+      requestAnimationFrame(() => requestAnimationFrame(() => btn.classList.add("gdt-placed")));
+    }
   }
 
   function setEnabled(enabled) {
