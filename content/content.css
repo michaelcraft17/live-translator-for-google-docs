@@ -46,6 +46,10 @@
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
 }
 
+.gdt-toolbar-btn.gdt-floating.gdt-placed {
+  transition: left 0.25s ease, top 0.25s ease, background-color 0.15s ease;
+}
+
 .gdt-toolbar-btn.gdt-floating.gdt-on {
   background: #d3e3fd;
 }
