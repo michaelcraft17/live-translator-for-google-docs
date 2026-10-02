@@ -173,3 +173,30 @@ body {
 [hidden] {
   display: none !important;
 }
+
+.gdt-panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.gdt-panel-tools select {
+  max-width: 140px;
+  font-size: 12px;
+  padding: 3px 4px;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  background: #fff;
+  color: #202124;
+}
+
+.gdt-icon-btn.gdt-off {
+  color: #9aa0a6;
+}
+
+.gdt-icon-btn.gdt-on {
+  background: #d3e3fd;
+  color: #0b57d0;
+}

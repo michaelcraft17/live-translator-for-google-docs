@@ -2478,6 +2478,7 @@
     return {
       type: "snapshot",
       enabled: state.enabled,
+      scrollSync: state.scrollSync,
       stale: state.stale,
       paragraphs: state.paragraphs.map((p) => ({
         id: p.id,
@@ -3138,6 +3139,7 @@
 
   function setScrollSync(scrollSync) {
     state.scrollSync = scrollSync;
+    postToPanel({ type: "scrollSync", scrollSync });
     chrome.storage.local.set({ gdt_scroll_sync: scrollSync });
   }
 
