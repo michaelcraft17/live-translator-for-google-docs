@@ -5,6 +5,8 @@
 const listEl = document.getElementById("list");
 const statusEl = document.getElementById("status");
 const staleEl = document.getElementById("staleBanner");
+const settingsEl = document.getElementById("settings");
+const settingsBtn = document.getElementById("settingsBtn");
 
 let tabId = null;
 let port = null;
@@ -135,6 +137,16 @@ function onMessage(msg) {
       break;
   }
 }
+
+// The gear swaps the translation list for the same settings the toolbar
+// popup has (popup/popup.js drives both).
+settingsBtn.addEventListener("click", () => {
+  const showing = settingsEl.hidden;
+  settingsEl.hidden = !showing;
+  listEl.hidden = showing;
+  settingsBtn.classList.toggle("gdt-on", showing);
+  settingsBtn.title = showing ? "Back to translation" : "Settings";
+});
 
 listEl.addEventListener("click", (e) => {
   const sEl = e.target.closest(".gdt-sentence");
