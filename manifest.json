@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Live Translator for Google Docs",
-  "version": "1.0.17",
+  "version": "1.0.28",
   "description": "Side-by-side live translation for Google Docs, with click-to-sync highlighting between the document and the translation.",
   "icons": {
     "16": "icons/icon16.png",
@@ -9,7 +9,10 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": ["storage"],
+  "permissions": [
+    "storage",
+    "sidePanel"
+  ],
   "host_permissions": [
     "https://docs.google.com/*",
     "https://translate.googleapis.com/*",
@@ -32,10 +35,20 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://docs.google.com/document/*"],
-      "js": ["content/content.js"],
-      "css": ["content/content.css"],
+      "matches": [
+        "https://docs.google.com/document/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "minimum_chrome_version": "114",
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  }
 }
