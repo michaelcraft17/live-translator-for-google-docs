@@ -75,6 +75,7 @@ between a sentence and its translation.
 | Permission | Justification to paste |
 | --- | --- |
 | `storage` | `Stores the user's own settings (target language, translation provider, API key) and a local cache of already-translated sentences, so that reopening a document does not re-translate and re-bill the same text.` |
+| `sidePanel` | `Shows the translation next to the document in Chrome's side panel, so the document narrows to make room instead of being covered. The panel is enabled only on Google Docs tabs.` |
 | `docs.google.com` | `The extension only runs on Google Docs. It reads the open document's text via Google's own export endpoint in order to translate it, and measures the on-screen position of the rendered page so the highlight can be drawn over the correct sentence.` |
 | `translation.googleapis.com` | `Sends the document's sentences to the Google Cloud Translation API for translation, using the API key the user supplied.` |
 | `api.deepl.com`, `api-free.deepl.com` | `Sends the document's sentences to the DeepL API for translation, using the API key the user supplied. Two hosts because DeepL routes free and paid keys to different endpoints.` |
