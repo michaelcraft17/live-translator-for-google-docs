@@ -169,6 +169,26 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "GDT_CLOSE_PANEL" && sender.tab) {
+    const tabId = sender.tab.id;
+    (async () => {
+      try {
+        if (chrome.sidePanel.close) {
+          await chrome.sidePanel.close({ tabId });
+        } else {
+          // Older Chrome has no close(); disabling the tab's panel and
+          // re-enabling it closes it.
+          await chrome.sidePanel.setOptions({ tabId, enabled: false });
+          await chrome.sidePanel.setOptions({ tabId, path: "sidepanel/sidepanel.html", enabled: true });
+        }
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+
   if (msg && msg.type === "GDT_OPEN_PANEL" && sender.tab) {
     // Must be called synchronously from the message that carries the user's
     // click — no awaiting anything first, or Chrome refuses it.

@@ -2528,7 +2528,9 @@
       if (state.sidePanelPort !== port) return;
       state.sidePanelPort = null;
       clearOriginalHighlight();
+      placeFloatingButton();
     });
+    placeFloatingButton();
     renderPanelFull();
     // Nothing has been fetched while the panel was closed, so catch up now.
     void refreshFromDoc();
@@ -3025,26 +3027,62 @@
 
   // ---------- floating toggle button ----------
 
+  // A round icon button in the Docs top bar, next to "Ask Gemini", that
+  // toggles the translation side panel the way that button toggles Gemini's.
+  // Docs rebuilds parts of its header from time to time and would drop a
+  // node it didn't make, so placeFloatingButton() re-attaches it on a timer.
+  const TRANSLATE_ICON_PATH =
+    "M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z";
+
   function createFloatingButton() {
     if (state.floatingBtn) return;
     const btn = document.createElement("button");
     btn.id = "gdt-floating-toggle";
-    btn.className = "gdt-floating-toggle";
+    btn.className = "gdt-toolbar-btn";
     btn.type = "button";
-    btn.textContent = "🌐 Translation";
+    btn.title = "Translate";
+    btn.setAttribute("aria-label", "Translate");
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="${TRANSLATE_ICON_PATH}"/></svg>`;
     // Opening a side panel has to happen in direct response to a click, so
     // hand the request to the background worker from inside the handler.
     btn.addEventListener("click", () => {
+      if (state.sidePanelPort) {
+        chrome.runtime.sendMessage({ type: "GDT_CLOSE_PANEL" }).catch(() => {});
+        return;
+      }
       if (!state.enabled) setEnabled(true);
       chrome.runtime.sendMessage({ type: "GDT_OPEN_PANEL" }).catch(() => {});
     });
-    document.body.appendChild(btn);
     state.floatingBtn = btn;
+    placeFloatingButton();
+    setInterval(placeFloatingButton, 1500);
+  }
+
+  function placeFloatingButton() {
+    const btn = state.floatingBtn;
+    if (!btn) return;
+    const gemini = Array.from(document.querySelectorAll('[aria-label*="Gemini" i]')).find(
+      (el) => el !== btn && el.getBoundingClientRect().width > 0
+    );
+    // The button itself may be wrapped (Docs wraps its toolbar buttons);
+    // sit beside the outermost wrapper that still lives in the same row.
+    let anchor = gemini;
+    while (anchor && anchor.parentElement && anchor.parentElement.children.length === 1) {
+      anchor = anchor.parentElement;
+    }
+    if (anchor && anchor.parentElement) {
+      btn.classList.remove("gdt-floating");
+      if (btn.nextElementSibling !== anchor) anchor.parentElement.insertBefore(btn, anchor);
+    } else {
+      // Gemini's button not found: a fixed spot at the top right still works.
+      btn.classList.add("gdt-floating");
+      if (btn.parentElement !== document.body) document.body.appendChild(btn);
+    }
+    btn.classList.toggle("gdt-on", !!state.sidePanelPort);
   }
 
   function setEnabled(enabled) {
     state.enabled = enabled;
-    if (state.floatingBtn) state.floatingBtn.classList.toggle("gdt-off", !enabled);
     if (!enabled) {
       clearOriginalHighlight();
       clearTranslatedHighlight();
