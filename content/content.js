@@ -3060,11 +3060,14 @@
   // Docs' header changes shape with its state — with the menus shown there
   // are two rows and Gemini's button sits in the first, with them hidden it
   // is one row and everything moves — so a fixed offset can't stay clear of
-  // it. Instead, every tick: park the button in the formatting toolbar's row
-  // at the right edge, then slide it left past anything Gemini-labelled that
+  // it. Instead, every tick: park the button just below the formatting
+  // toolbar at the right edge, then slide it left past anything Gemini-labelled that
   // it would otherwise overlap.
   const BUTTON_SIZE_PX = 40;
   const BUTTON_GAP_PX = 8;
+  // Just under the toolbar row, not in it: the row's right end holds Docs'
+  // own "hide the menus" chevron, which the button would cover.
+  const TOOLBAR_CLEARANCE_PX = 6;
   const HEADER_SCAN_PX = 160; // Gemini's buttons live in the header, never lower
 
   function headerObstacles(btn) {
@@ -3091,7 +3094,7 @@
     const tr = toolbar ? toolbar.getBoundingClientRect() : null;
     const top =
       tr && tr.height > 0 && tr.top < HEADER_SCAN_PX
-        ? Math.round(tr.top + (tr.height - BUTTON_SIZE_PX) / 2)
+        ? Math.round(tr.bottom + TOOLBAR_CLEARANCE_PX)
         : 12;
     let left = window.innerWidth - 24 - BUTTON_SIZE_PX;
     const obstacles = headerObstacles(btn);
