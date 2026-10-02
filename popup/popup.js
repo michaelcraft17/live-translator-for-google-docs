@@ -82,12 +82,15 @@ apiKeyInput.addEventListener("change", async () => {
 
 // sidePanel.open() has to run straight from the click, so no awaiting
 // anything (like getActiveTab) before it.
-openPanelBtn.addEventListener("click", () => {
-  chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-    if (!isDocsTab(tab)) return;
-    chrome.sidePanel.open({ tabId: tab.id }).then(() => window.close());
+// (Absent when this script is loaded inside the side panel's settings view.)
+if (openPanelBtn) {
+  openPanelBtn.addEventListener("click", () => {
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (!isDocsTab(tab)) return;
+      chrome.sidePanel.open({ tabId: tab.id }).then(() => window.close());
+    });
   });
-});
+}
 
 retranslateBtn.addEventListener("click", () => {
   sendToContent({ type: "GDT_FORCE_RETRANSLATE" });

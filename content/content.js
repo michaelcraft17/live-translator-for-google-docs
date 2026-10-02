@@ -3067,7 +3067,11 @@
   const BUTTON_GAP_PX = 8;
   // Just under the toolbar row, not in it: the row's right end holds Docs'
   // own "hide the menus" chevron, which the button would cover.
-  const TOOLBAR_CLEARANCE_PX = 6;
+  const TOOLBAR_CLEARANCE_PX = 50;
+  // Tweak these two to move the button: bigger CLEARANCE = lower, bigger
+  // RIGHT_MARGIN = further left. (Used while the menus are hidden: the top
+  // is 12 instead.)
+  const BUTTON_RIGHT_MARGIN_PX = 85;
   const HEADER_SCAN_PX = 160; // Gemini's buttons live in the header, never lower
 
   function headerObstacles(btn) {
@@ -3096,7 +3100,7 @@
       tr && tr.height > 0 && tr.top < HEADER_SCAN_PX
         ? Math.round(tr.bottom + TOOLBAR_CLEARANCE_PX)
         : 12;
-    let left = window.innerWidth - 24 - BUTTON_SIZE_PX;
+    let left = window.innerWidth - BUTTON_RIGHT_MARGIN_PX - BUTTON_SIZE_PX;
     const obstacles = headerObstacles(btn);
     // Each move can land on another obstacle, so settle over a few passes.
     for (let pass = 0; pass < 4; pass++) {
@@ -3125,7 +3129,10 @@
       clearTranslatedHighlight();
     }
     postToPanel({ type: "enabled", enabled });
-    if (enabled) void refreshFromDoc();
+    if (enabled) {
+      renderPanelFull(); // the panel emptied itself when told translation was off
+      void refreshFromDoc();
+    }
     chrome.storage.local.set({ gdt_enabled: enabled });
   }
 
