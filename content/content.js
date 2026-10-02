@@ -3076,7 +3076,7 @@
   const BUTTON_GAP_PX = 8;
   // Just under the toolbar row, not in it: the row's right end holds Docs'
   // own "hide the menus" chevron, which the button would cover.
-  const TOOLBAR_CLEARANCE_PX = 50;
+  const TOOLBAR_CLEARANCE_PX = 56;
   // Tweak these two to move the button: bigger CLEARANCE = lower, bigger
   // RIGHT_MARGIN = further left. (Used while the menus are hidden: the top
   // is 12 instead.)
