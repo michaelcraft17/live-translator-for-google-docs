@@ -11,6 +11,7 @@ const backendSel = document.getElementById("backend");
 const apiKeyRow = document.getElementById("apiKeyRow");
 const apiKeyInput = document.getElementById("apiKey");
 const retranslateBtn = document.getElementById("retranslate");
+const openPanelBtn = document.getElementById("openPanel");
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -48,11 +49,11 @@ async function init() {
     const state = await sendToContent({ type: "GDT_GET_STATE" });
     if (state && state.ok) {
       enabledToggle.checked = state.enabled;
-      scrollSyncToggle.checked = state.scrollSync;
+      if (scrollSyncToggle) scrollSyncToggle.checked = state.scrollSync;
     }
   } else {
     enabledToggle.disabled = true;
-    scrollSyncToggle.disabled = true;
+    if (scrollSyncToggle) scrollSyncToggle.disabled = true;
     retranslateBtn.disabled = true;
   }
 }
@@ -61,9 +62,12 @@ enabledToggle.addEventListener("change", () => {
   sendToContent({ type: "GDT_SET_ENABLED", enabled: enabledToggle.checked });
 });
 
-scrollSyncToggle.addEventListener("change", () => {
-  sendToContent({ type: "GDT_SET_SCROLL_SYNC", scrollSync: scrollSyncToggle.checked });
-});
+// (Absent in the side panel, which has its own scroll-sync button.)
+if (scrollSyncToggle) {
+  scrollSyncToggle.addEventListener("change", () => {
+    sendToContent({ type: "GDT_SET_SCROLL_SYNC", scrollSync: scrollSyncToggle.checked });
+  });
+}
 
 targetLangSel.addEventListener("change", async () => {
   await chrome.storage.sync.set({ targetLang: targetLangSel.value });
@@ -78,6 +82,18 @@ backendSel.addEventListener("change", async () => {
 apiKeyInput.addEventListener("change", async () => {
   await chrome.storage.sync.set({ apiKey: apiKeyInput.value });
 });
+
+// sidePanel.open() has to run straight from the click, so no awaiting
+// anything (like getActiveTab) before it.
+// (Absent when this script is loaded inside the side panel's settings view.)
+if (openPanelBtn) {
+  openPanelBtn.addEventListener("click", () => {
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (!isDocsTab(tab)) return;
+      chrome.sidePanel.open({ tabId: tab.id }).then(() => window.close());
+    });
+  });
+}
 
 retranslateBtn.addEventListener("click", () => {
   sendToContent({ type: "GDT_FORCE_RETRANSLATE" });

@@ -97,8 +97,7 @@
    *   docId: string|null,
    *   enabled: boolean,
    *   targetLang: string,
-   *   panelEl: HTMLElement|null,
-   *   panelListEl: HTMLElement|null,
+   *   sidePanelPort: chrome.runtime.Port|null,
    *   floatingBtn: HTMLElement|null,
    *   paragraphs: Array<{
    *     id: string,
@@ -106,7 +105,6 @@
    *     text: string,
    *     sentences: Array<{ id: string, text: string, translated: string|null, error: string|null }>,
    *     mirrorEls: Element[],
-   *     panelEl: HTMLElement|null,
    *   }>,
    *   activeHighlight: { paragraph: object, sentenceIndex: number } | null,
    *   activeHighlightBoxes: HTMLElement[],
@@ -122,9 +120,7 @@
     enabled: true,
     scrollSync: true,
     targetLang: "zh-CN",
-    panelEl: null,
-    panelListEl: null,
-    staleBannerEl: null,
+    sidePanelPort: null,
     stale: false,
     floatingBtn: null,
     paragraphs: [],
@@ -371,7 +367,6 @@
         error: null,
       })),
       mirrorEls: [],
-      panelEl: null,
     };
   }
 
@@ -2456,56 +2451,56 @@
     }
   }
 
-  // ---------- panel rendering ----------
+  // ---------- side panel bridge ----------
+  //
+  // The translation list lives in the browser's own side panel
+  // (sidepanel/sidepanel.js), not on the page: a native side panel narrows
+  // the page's real viewport, so Docs re-lays itself out around it the same
+  // way it does for its own Gemini panel — something no amount of
+  // restyling from inside the page could get Docs' canvas to do.
+  //
+  // This script stays the source of truth (it alone can see the document,
+  // the mirror and the highlight boxes) and pushes what the panel needs
+  // over a long-lived port the panel opens to this tab. The port also tells
+  // us whether a panel is open at all, so a closed panel costs no export
+  // fetches or translation requests.
 
-  function getToolbarHeight() {
-    const chromeBar = document.querySelector("#docs-chrome");
-    if (chromeBar) {
-      const r = chromeBar.getBoundingClientRect();
-      if (r.height > 0) return Math.round(r.top + r.height);
+  function postToPanel(msg) {
+    if (!state.sidePanelPort) return;
+    try {
+      state.sidePanelPort.postMessage(msg);
+    } catch (err) {
+      state.sidePanelPort = null;
     }
-    return 132;
   }
 
-  function positionSidebar() {
-    if (!state.panelEl) return;
-    const top = getToolbarHeight();
-    state.panelEl.style.top = `${top}px`;
-    state.panelEl.style.height = `calc(100vh - ${top}px)`;
+  function snapshotForPanel() {
+    return {
+      type: "snapshot",
+      enabled: state.enabled,
+      scrollSync: state.scrollSync,
+      stale: state.stale,
+      paragraphs: state.paragraphs.map((p) => ({
+        id: p.id,
+        place: p.place,
+        // Sum across fragments (a straddling paragraph has more than one) —
+        // purely cosmetic, keeps an entry roughly as tall as its original.
+        minHeight: (p.mirrorEls || []).reduce((sum, el) => sum + el.getBoundingClientRect().height, 0),
+        sentences: p.sentences.map((s) => ({ id: s.id, text: s.text, translated: s.translated, error: s.error })),
+      })),
+    };
   }
 
-  function ensurePanelContainer() {
-    if (state.panelEl && document.body.contains(state.panelEl)) {
-      return state.panelEl;
-    }
+  function renderPanelFull() {
+    postToPanel(snapshotForPanel());
+  }
 
-    const panel = document.createElement("div");
-    panel.id = "gdt-translation-panel";
-    panel.className = "gdt-panel gdt-panel-sidebar";
-
-    const header = document.createElement("div");
-    header.className = "gdt-panel-header";
-    header.textContent = "Translation";
-    panel.appendChild(header);
-
-    const staleBanner = document.createElement("div");
-    staleBanner.className = "gdt-panel-stale-banner";
-    staleBanner.textContent =
-      "⚠ Google is rate-limiting updates — translations and highlight positions below may be out of date with the document.";
-    staleBanner.hidden = !state.stale;
-    panel.appendChild(staleBanner);
-
-    const list = document.createElement("div");
-    list.className = "gdt-panel-list";
-    panel.appendChild(list);
-
-    document.body.appendChild(panel);
-
-    state.panelEl = panel;
-    state.panelListEl = list;
-    state.staleBannerEl = staleBanner;
-    positionSidebar();
-    return panel;
+  function updatePanelSentenceText(paragraph, sentence) {
+    postToPanel({
+      type: "sentence",
+      pId: paragraph.id,
+      sentence: { id: sentence.id, text: sentence.text, translated: sentence.translated, error: sentence.error },
+    });
   }
 
   // Surfaces the "stale mirror/translations" state described in the note
@@ -2516,61 +2511,43 @@
   function setStale(stale) {
     if (state.stale === stale) return;
     state.stale = stale;
-    if (state.staleBannerEl) state.staleBannerEl.hidden = !stale;
+    postToPanel({ type: "stale", stale });
   }
 
-  function buildPanelParagraphEl(p) {
-    const pEl = document.createElement("div");
-    pEl.className = "gdt-panel-paragraph";
-    pEl.dataset.gdtParagraphId = p.id;
-    // Header and footer entries are labelled: they have no counterpart to
-    // highlight in the document (Docs draws them in the page margin, which
-    // the mirror doesn't cover), so without a label they'd read as body
-    // text that mysteriously won't highlight.
-    if (p.place && p.place !== "body") pEl.dataset.gdtPlace = p.place;
-
-    // Sum across fragments (a straddling paragraph has more than one) —
-    // purely cosmetic (keeps the panel's line roughly as tall as the
-    // original), so summing rather than reasoning about page gaps is fine.
-    const totalHeight = (p.mirrorEls || []).reduce((sum, el) => sum + el.getBoundingClientRect().height, 0);
-    if (totalHeight > 0) pEl.style.minHeight = `${totalHeight}px`;
-
-    if (!p.sentences.length) {
-      pEl.innerHTML = "&nbsp;"; // preserve blank-line spacing
-    } else {
-      for (const s of p.sentences) {
-        const sEl = document.createElement("span");
-        sEl.className = "gdt-sentence";
-        sEl.dataset.gdtParagraphId = p.id;
-        sEl.dataset.gdtSentenceId = s.id;
-        sEl.textContent = s.error ? `⚠ ${s.text}` : s.translated !== null ? s.translated : "…";
-        if (s.error) sEl.classList.add("gdt-sentence-error");
-        pEl.appendChild(sEl);
-        pEl.appendChild(document.createTextNode(" "));
+  function onPanelConnect(port) {
+    if (port.name !== "gdt-panel") return;
+    if (state.sidePanelPort) {
+      try {
+        state.sidePanelPort.disconnect();
+      } catch (err) {
+        // already gone
       }
     }
-    return pEl;
+    state.sidePanelPort = port;
+    port.onMessage.addListener((msg) => handlePanelMessage(msg));
+    port.onDisconnect.addListener(() => {
+      if (state.sidePanelPort !== port) return;
+      state.sidePanelPort = null;
+      clearOriginalHighlight();
+      placeFloatingButton();
+    });
+    placeFloatingButton();
+    renderPanelFull();
+    // Nothing has been fetched while the panel was closed, so catch up now.
+    void refreshFromDoc();
   }
 
-  function renderPanelFull() {
-    const panel = ensurePanelContainer();
-    panel.style.display = state.enabled ? "" : "none";
-    const list = state.panelListEl;
-    list.innerHTML = "";
-    for (const p of state.paragraphs) {
-      const pEl = buildPanelParagraphEl(p);
-      p.panelEl = pEl;
-      list.appendChild(pEl);
+  function handlePanelMessage(msg) {
+    if (!msg) return;
+    if (msg.type === "click") {
+      const paragraph = state.paragraphs.find((p) => p.id === msg.pId);
+      if (!paragraph) return;
+      const sIdx = paragraph.sentences.findIndex((s) => s.id === msg.sId);
+      if (sIdx < 0) return;
+      highlightOriginal(paragraph, sIdx);
+    } else if (msg.type === "panelScroll") {
+      if (typeof scrollDocToParagraph === "function") scrollDocToParagraph(msg.pId, msg.fraction);
     }
-  }
-
-  function updatePanelSentenceText(paragraph, sentence) {
-    if (!paragraph.panelEl) return;
-    const sel = `.gdt-sentence[data-gdt-paragraph-id="${paragraph.id}"][data-gdt-sentence-id="${sentence.id}"]`;
-    const sEl = paragraph.panelEl.querySelector(sel);
-    if (!sEl) return;
-    sEl.textContent = sentence.error ? `⚠ ${sentence.text}` : sentence.translated;
-    sEl.classList.toggle("gdt-sentence-error", !!sentence.error);
   }
 
   // ---------- highlighting ----------
@@ -2675,20 +2652,11 @@
   }
 
   function clearTranslatedHighlight() {
-    if (!state.panelListEl) return;
-    state.panelListEl
-      .querySelectorAll(".gdt-sentence.gdt-active")
-      .forEach((el) => el.classList.remove("gdt-active"));
+    postToPanel({ type: "active", pId: null });
   }
 
   function highlightTranslatedSentence(paragraph, sentence, { scroll = true } = {}) {
-    clearTranslatedHighlight();
-    if (!paragraph.panelEl) return;
-    const sel = `.gdt-sentence[data-gdt-paragraph-id="${paragraph.id}"][data-gdt-sentence-id="${sentence.id}"]`;
-    const sEl = paragraph.panelEl.querySelector(sel);
-    if (!sEl) return;
-    sEl.classList.add("gdt-active");
-    if (scroll) sEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    postToPanel({ type: "active", pId: paragraph.id, sId: sentence.id, scroll });
   }
 
   // ---------- click handling ----------
@@ -2810,7 +2778,7 @@
 
   function onOriginalClick(event) {
     if (!state.enabled) return;
-    if (event.target.closest("#gdt-translation-panel, #gdt-floating-toggle")) return;
+    if (event.target.closest("#gdt-floating-toggle")) return;
     const clickX = event.clientX;
     const clickY = event.clientY;
     setTimeout(() => {
@@ -2849,49 +2817,17 @@
     if (sIdx < 0) return;
     const sentence = paragraph.sentences[sIdx];
 
-    // TEMP DIAGNOSTIC — checks whether paragraph.panelEl actually belongs to
-    // this same paragraph (its own text should match paragraph.text). Safe
-    // to delete once the bug is found.
-    try {
-      if (state.mirror && state.mirror.host) {
-        state.mirror.host.dataset.gdtPanelCheck = JSON.stringify({
-          paragraphId: paragraph.id,
-          paragraphText: paragraph.text.slice(0, 60),
-          sentenceCount: paragraph.sentences.length,
-          sIdx,
-          sentenceId: sentence.id,
-          sentenceText: (sentence.text || "").slice(0, 60),
-          panelElParagraphId: paragraph.panelEl ? paragraph.panelEl.dataset.gdtParagraphId : null,
-          panelElText: paragraph.panelEl ? paragraph.panelEl.textContent.slice(0, 60) : null,
-        });
-      }
-    } catch (e) {
-      // ignore
-    }
-
     highlightOriginal(paragraph, sIdx);
     highlightTranslatedSentence(paragraph, sentence);
-  }
-
-  function onPanelClick(event) {
-    const sEl = event.target.closest(".gdt-sentence");
-    if (!sEl) return;
-    const pId = sEl.dataset.gdtParagraphId;
-    const sId = sEl.dataset.gdtSentenceId;
-    const paragraph = state.paragraphs.find((p) => p.id === pId);
-    if (!paragraph) return;
-    const sIdx = paragraph.sentences.findIndex((s) => s.id === sId);
-    if (sIdx < 0) return;
-    const sentence = paragraph.sentences[sIdx];
-
-    highlightTranslatedSentence(paragraph, sentence, { scroll: false });
-    highlightOriginal(paragraph, sIdx);
   }
 
   // ---------- refresh (poll-based — canvas repaints aren't DOM mutations) ----------
 
   async function refreshFromDoc() {
     if (!state.docId) return;
+    // No open side panel (or translation switched off) means nobody to show
+    // anything to, and every export request counts against the rate limit.
+    if (!state.sidePanelPort || !state.enabled) return;
     // Nobody is looking at this browser tab, so there's nothing to keep
     // current — and every export request counts against the rate limit.
     if (document.hidden) return;
@@ -3008,19 +2944,16 @@
     }, 60);
   }
 
+  // Set by setupScrollSync; lets a scroll the user makes in the side panel
+  // (relayed as a "panelScroll" message) move the document.
+  let scrollDocToParagraph = null;
+
   function setupScrollSync() {
     const main = getMainScroller();
     const isWindowScroller = main === document.scrollingElement || main === document.documentElement;
 
-    const mainScrollTop = () => (isWindowScroller ? window.scrollY : main.scrollTop);
-    const mainMaxScroll = () =>
-      isWindowScroller
-        ? document.documentElement.scrollHeight - window.innerHeight
-        : main.scrollHeight - main.clientHeight;
-
-    // Where "the top of what the reader is looking at" is, on each side.
+    // Where "the top of what the reader is looking at" is, in the document.
     const docAnchorY = () => (isWindowScroller ? 0 : main.getBoundingClientRect().top);
-    const panelAnchorY = () => state.panelListEl.getBoundingClientRect().top;
 
     // The paragraph straddling a given viewport Y, and how far through it
     // that Y falls. Both sides are keyed off this rather than off a
@@ -3043,34 +2976,21 @@
       return chosen;
     }
 
-    function panelParagraphAt(y) {
-      let chosen = null;
-      for (const el of state.panelListEl.querySelectorAll(".gdt-panel-paragraph")) {
-        const rect = el.getBoundingClientRect();
-        if (rect.height <= 0) continue;
-        if (rect.top <= y) chosen = { el, rect };
-        else if (chosen) return chosen;
-      }
-      return chosen;
-    }
-
     const fractionThrough = (y, rect) =>
       Math.max(0, Math.min(1, rect.height > 0 ? (y - rect.top) / rect.height : 0));
 
-    const proportionalToPanel = () => {
-      const max = mainMaxScroll();
-      const panelMax = state.panelListEl.scrollHeight - state.panelListEl.clientHeight;
-      if (max <= 0 || panelMax <= 0) return;
-      state.panelListEl.scrollTop = (mainScrollTop() / max) * panelMax;
-    };
-
-    const proportionalToDoc = () => {
-      const panelMax = state.panelListEl.scrollHeight - state.panelListEl.clientHeight;
-      const max = mainMaxScroll();
-      if (max <= 0 || panelMax <= 0) return;
-      const fraction = state.panelListEl.scrollTop / panelMax;
-      if (isWindowScroller) window.scrollTo(0, fraction * max);
-      else main.scrollTop = fraction * max;
+    scrollDocToParagraph = (pId, fraction) => {
+      if (scrollSyncLock || !state.enabled || !state.scrollSync) return;
+      const paragraph = state.paragraphs.find((p) => p.id === pId);
+      const mirrorEl = paragraph && paragraph.mirrorEls && paragraph.mirrorEls[0];
+      if (!mirrorEl) return;
+      scrollSyncLock = true;
+      const mirrorRect = mirrorEl.getBoundingClientRect();
+      const wanted = mirrorRect.top + Math.max(0, Math.min(1, fraction || 0)) * mirrorRect.height;
+      const offset = wanted - docAnchorY();
+      if (isWindowScroller) window.scrollBy(0, offset);
+      else main.scrollTop += offset;
+      releaseScrollLockSoon();
     };
 
     const onMainScroll = () => {
@@ -3079,98 +2999,167 @@
       // descendant of this same scroller, so native scrolling carries it
       // along for free. That's independent of scrollSync below, which only
       // governs the *panel-follows-doc* convenience behavior.
-      if (scrollSyncLock || !state.panelListEl || !state.enabled || !state.scrollSync) return;
-      scrollSyncLock = true;
+      if (scrollSyncLock || !state.sidePanelPort || !state.enabled || !state.scrollSync) return;
       const anchorY = docAnchorY();
       const source = docParagraphAt(anchorY);
-      const target = source
-        ? state.panelListEl.querySelector(`[data-gdt-paragraph-id="${CSS.escape(source.id)}"]`)
-        : null;
-      if (target) {
-        const targetRect = target.getBoundingClientRect();
-        const offset =
-          targetRect.top - panelAnchorY() + fractionThrough(anchorY, source.rect) * targetRect.height;
-        state.panelListEl.scrollTop += offset;
-      } else {
-        // No mirror yet (or a paragraph the panel doesn't have) — the old
-        // percentage mapping is still better than nothing.
-        proportionalToPanel();
-      }
-      releaseScrollLockSoon();
-    };
-
-    const onPanelScroll = () => {
-      if (scrollSyncLock || !state.panelListEl || !state.enabled || !state.scrollSync) return;
+      if (!source) return;
       scrollSyncLock = true;
-      const anchorY = panelAnchorY();
-      const source = panelParagraphAt(anchorY);
-      const paragraph = source
-        ? state.paragraphs.find((p) => p.id === source.el.dataset.gdtParagraphId)
-        : null;
-      const mirrorEl = paragraph && paragraph.mirrorEls && paragraph.mirrorEls[0];
-      if (mirrorEl) {
-        const mirrorRect = mirrorEl.getBoundingClientRect();
-        const wanted = mirrorRect.top + fractionThrough(anchorY, source.rect) * mirrorRect.height;
-        const offset = wanted - docAnchorY();
-        if (isWindowScroller) window.scrollBy(0, offset);
-        else main.scrollTop += offset;
-      } else {
-        proportionalToDoc();
-      }
+      postToPanel({ type: "scrollTo", pId: source.id, fraction: fractionThrough(anchorY, source.rect) });
       releaseScrollLockSoon();
     };
 
     // Scroll fires far faster than the layout reads above are worth doing,
     // and every one of those reads forces a synchronous layout — once per
     // frame is both smooth and plenty.
-    const throttled = (fn) => {
-      let queued = false;
-      return () => {
+    let queued = false;
+    (isWindowScroller ? window : main).addEventListener(
+      "scroll",
+      () => {
         if (queued) return;
         queued = true;
         requestAnimationFrame(() => {
           queued = false;
-          fn();
+          onMainScroll();
         });
-      };
-    };
-
-    (isWindowScroller ? window : main).addEventListener("scroll", throttled(onMainScroll), { passive: true });
-    if (state.panelListEl) {
-      state.panelListEl.addEventListener("scroll", throttled(onPanelScroll), { passive: true });
-    }
+      },
+      { passive: true }
+    );
   }
 
   // ---------- floating toggle button ----------
+
+  // A round icon button at the top right of Docs that toggles the
+  // translation side panel the way "Ask Gemini" toggles Gemini's.
+  const TRANSLATE_ICON_PATH =
+    "M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z";
 
   function createFloatingButton() {
     if (state.floatingBtn) return;
     const btn = document.createElement("button");
     btn.id = "gdt-floating-toggle";
-    btn.className = "gdt-floating-toggle";
+    btn.className = "gdt-toolbar-btn gdt-floating";
     btn.type = "button";
-    btn.textContent = "🌐 Translation: On";
-    btn.addEventListener("click", () => setEnabled(!state.enabled));
-    document.body.appendChild(btn);
+    btn.title = "Translate";
+    btn.setAttribute("aria-label", "Translate");
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="${TRANSLATE_ICON_PATH}"/></svg>`;
+    // Opening a side panel has to happen in direct response to a click, so
+    // hand the request to the background worker from inside the handler.
+    btn.addEventListener("click", () => {
+      if (state.sidePanelPort) {
+        chrome.runtime.sendMessage({ type: "GDT_CLOSE_PANEL" }).catch(() => {});
+        return;
+      }
+      if (!state.enabled) setEnabled(true);
+      chrome.runtime.sendMessage({ type: "GDT_OPEN_PANEL" }).catch(() => {});
+    });
     state.floatingBtn = btn;
+    placeFloatingButton();
+    setInterval(placeFloatingButton, 500);
+    // The panel opening or closing resizes the viewport over a few frames
+    // while Docs reflows its header; follow along immediately and settle
+    // again once things have stopped moving, instead of waiting for the
+    // next tick and jumping.
+    const settleSoon = debounce(placeFloatingButton, 150);
+    window.addEventListener("resize", () => {
+      placeFloatingButton();
+      settleSoon();
+    });
+  }
+
+  // Docs' header changes shape with its state — with the menus shown there
+  // are two rows and Gemini's button sits in the first, with them hidden it
+  // is one row and everything moves — so a fixed offset can't stay clear of
+  // it. Instead, every tick: park the button just below the formatting
+  // toolbar at the right edge, then slide it left past anything Gemini-labelled that
+  // it would otherwise overlap.
+  const BUTTON_SIZE_PX = 40;
+  const BUTTON_GAP_PX = 8;
+  // Just under the toolbar row, not in it: the row's right end holds Docs'
+  // own "hide the menus" chevron, which the button would cover.
+  const TOOLBAR_CLEARANCE_PX = 56;
+  // Tweak these two to move the button: bigger CLEARANCE = lower, bigger
+  // RIGHT_MARGIN = further left. (Used while the menus are hidden: the top
+  // is 12 instead.)
+  const BUTTON_RIGHT_MARGIN_PX = 85;
+  const HEADER_SCAN_PX = 160; // Gemini's buttons live in the header, never lower
+
+  function headerObstacles(btn) {
+    const out = [];
+    for (const el of document.querySelectorAll("button, [role='button'], [aria-label], [data-tooltip]")) {
+      if (el === btn || btn.contains(el)) continue;
+      const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-tooltip") || ""} ${
+        el.childElementCount === 0 ? el.textContent || "" : ""
+      }`;
+      if (!/gemini/i.test(label)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.top < HEADER_SCAN_PX) out.push(r);
+    }
+    return out;
+  }
+
+  function placeFloatingButton() {
+    const btn = state.floatingBtn;
+    if (!btn) return;
+    if (btn.parentElement !== document.body) document.body.appendChild(btn);
+    btn.classList.toggle("gdt-on", !!state.sidePanelPort);
+
+    const toolbar = document.querySelector("#docs-toolbar");
+    const tr = toolbar ? toolbar.getBoundingClientRect() : null;
+    const top =
+      tr && tr.height > 0 && tr.top < HEADER_SCAN_PX
+        ? Math.round(tr.bottom + TOOLBAR_CLEARANCE_PX)
+        : 12;
+    const viewportW = document.documentElement.clientWidth;
+    let left = viewportW - BUTTON_RIGHT_MARGIN_PX - BUTTON_SIZE_PX;
+    const obstacles = headerObstacles(btn);
+    // Each move can land on another obstacle, so settle over a few passes.
+    for (let pass = 0; pass < 4; pass++) {
+      let moved = false;
+      for (const o of obstacles) {
+        const clashes =
+          left < o.right + BUTTON_GAP_PX &&
+          left + BUTTON_SIZE_PX > o.left - BUTTON_GAP_PX &&
+          top < o.bottom &&
+          top + BUTTON_SIZE_PX > o.top;
+        if (clashes) {
+          left = Math.round(o.left - BUTTON_GAP_PX - BUTTON_SIZE_PX);
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    // Anchored by `right`, not `left`: when the side panel resizes the
+    // viewport, a right-anchored fixed element rides the new edge in
+    // lockstep with the browser's own layout, with no script (and so no
+    // lag) in the loop. Only a change in the clearance from the Gemini
+    // button — a different `right` value — is animated.
+    btn.style.top = `${top}px`;
+    btn.style.left = "auto";
+    btn.style.right = `${Math.max(0, viewportW - left - BUTTON_SIZE_PX)}px`;
+    // Slide between positions, but not on the very first placement (that
+    // would glide in from the corner).
+    if (!btn.classList.contains("gdt-placed")) {
+      requestAnimationFrame(() => requestAnimationFrame(() => btn.classList.add("gdt-placed")));
+    }
   }
 
   function setEnabled(enabled) {
     state.enabled = enabled;
-    if (state.panelEl) state.panelEl.style.display = enabled ? "" : "none";
-    if (state.floatingBtn) {
-      state.floatingBtn.textContent = `🌐 Translation: ${enabled ? "On" : "Off"}`;
-      state.floatingBtn.classList.toggle("gdt-off", !enabled);
-    }
     if (!enabled) {
       clearOriginalHighlight();
       clearTranslatedHighlight();
+    }
+    postToPanel({ type: "enabled", enabled });
+    if (enabled) {
+      renderPanelFull(); // the panel emptied itself when told translation was off
+      void refreshFromDoc();
     }
     chrome.storage.local.set({ gdt_enabled: enabled });
   }
 
   function setScrollSync(scrollSync) {
     state.scrollSync = scrollSync;
+    postToPanel({ type: "scrollSync", scrollSync });
     chrome.storage.local.set({ gdt_scroll_sync: scrollSync });
   }
 
@@ -3220,9 +3209,7 @@
     }
 
     document.addEventListener("click", onOriginalClick, true);
-    document.addEventListener("click", (e) => {
-      if (e.target.closest("#gdt-translation-panel")) onPanelClick(e);
-    });
+    chrome.runtime.onConnect.addListener(onPanelConnect);
 
     setInterval(refreshFromDoc, REFRESH_POLL_MS);
     // Switching document tabs only changes the URL (no page load), so watch
@@ -3243,7 +3230,6 @@
     window.addEventListener(
       "resize",
       debounce(() => {
-        positionSidebar();
         rebuildMirror();
         if (state.activeHighlight) renderHighlightBoxes();
       }, RESIZE_DEBOUNCE_MS)
