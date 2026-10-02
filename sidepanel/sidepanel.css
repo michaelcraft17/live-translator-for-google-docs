@@ -200,3 +200,25 @@ body {
   background: #d3e3fd;
   color: #0b57d0;
 }
+
+/* Scroll sync, drawn as two Joy-Con-style bars: snapped together while
+   syncing, pulled apart (and slightly out of line) when not. */
+.gdt-joycon rect {
+  transition: transform 0.18s ease;
+}
+
+.gdt-icon-btn.gdt-on .gdt-joycon-left {
+  transform: translateX(3px);
+}
+
+.gdt-icon-btn.gdt-on .gdt-joycon-right {
+  transform: translateX(-3px);
+}
+
+.gdt-icon-btn.gdt-off .gdt-joycon-right {
+  transform: translateY(2px);
+}
+
+.gdt-icon-btn.gdt-off .gdt-joycon-left {
+  transform: translateY(-2px);
+}
