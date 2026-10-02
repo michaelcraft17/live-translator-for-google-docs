@@ -3109,7 +3109,8 @@
       tr && tr.height > 0 && tr.top < HEADER_SCAN_PX
         ? Math.round(tr.bottom + TOOLBAR_CLEARANCE_PX)
         : 12;
-    let left = window.innerWidth - BUTTON_RIGHT_MARGIN_PX - BUTTON_SIZE_PX;
+    const viewportW = document.documentElement.clientWidth;
+    let left = viewportW - BUTTON_RIGHT_MARGIN_PX - BUTTON_SIZE_PX;
     const obstacles = headerObstacles(btn);
     // Each move can land on another obstacle, so settle over a few passes.
     for (let pass = 0; pass < 4; pass++) {
@@ -3127,8 +3128,14 @@
       }
       if (!moved) break;
     }
+    // Anchored by `right`, not `left`: when the side panel resizes the
+    // viewport, a right-anchored fixed element rides the new edge in
+    // lockstep with the browser's own layout, with no script (and so no
+    // lag) in the loop. Only a change in the clearance from the Gemini
+    // button — a different `right` value — is animated.
     btn.style.top = `${top}px`;
-    btn.style.left = `${left}px`;
+    btn.style.left = "auto";
+    btn.style.right = `${Math.max(0, viewportW - left - BUTTON_SIZE_PX)}px`;
     // Slide between positions, but not on the very first placement (that
     // would glide in from the corner).
     if (!btn.classList.contains("gdt-placed")) {

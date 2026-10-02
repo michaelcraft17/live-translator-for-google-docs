@@ -47,7 +47,7 @@
 }
 
 .gdt-toolbar-btn.gdt-floating.gdt-placed {
-  transition: left 0.25s ease, top 0.25s ease, background-color 0.15s ease;
+  transition: right 0.2s ease, top 0.2s ease, background-color 0.15s ease;
 }
 
 .gdt-toolbar-btn.gdt-floating.gdt-on {
