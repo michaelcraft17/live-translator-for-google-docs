@@ -7,6 +7,7 @@ const statusEl = document.getElementById("status");
 const staleEl = document.getElementById("staleBanner");
 const settingsEl = document.getElementById("settings");
 const settingsBtn = document.getElementById("settingsBtn");
+const scrollSyncBtn = document.getElementById("scrollSyncBtn");
 
 let tabId = null;
 let port = null;
@@ -68,7 +69,15 @@ function setActive(pId, sId, scroll) {
   if (scroll) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
+function showScrollSync(on) {
+  scrollSyncBtn.classList.toggle("gdt-on", !!on);
+  scrollSyncBtn.classList.toggle("gdt-off", !on);
+  scrollSyncBtn.title = on ? "Scroll sync: on (click to turn off)" : "Scroll sync: off (click to turn on)";
+  scrollSyncBtn.dataset.on = on ? "1" : "";
+}
+
 function render(snapshot) {
+  if (typeof snapshot.scrollSync === "boolean") showScrollSync(snapshot.scrollSync);
   staleEl.hidden = !snapshot.stale;
   listEl.textContent = "";
   if (!snapshot.enabled) {
@@ -132,11 +141,20 @@ function onMessage(msg) {
         setStatus("Translation is turned off.");
       }
       break;
+    case "scrollSync":
+      showScrollSync(msg.scrollSync);
+      break;
     case "scrollTo":
       scrollToParagraph(msg.pId, msg.fraction);
       break;
   }
 }
+
+scrollSyncBtn.addEventListener("click", () => {
+  const next = !scrollSyncBtn.dataset.on;
+  showScrollSync(next);
+  if (tabId !== null) chrome.tabs.sendMessage(tabId, { type: "GDT_SET_SCROLL_SYNC", scrollSync: next }).catch(() => {});
+});
 
 // The gear swaps the translation list for the same settings the toolbar
 // popup has (popup/popup.js drives both).

@@ -49,11 +49,11 @@ async function init() {
     const state = await sendToContent({ type: "GDT_GET_STATE" });
     if (state && state.ok) {
       enabledToggle.checked = state.enabled;
-      scrollSyncToggle.checked = state.scrollSync;
+      if (scrollSyncToggle) scrollSyncToggle.checked = state.scrollSync;
     }
   } else {
     enabledToggle.disabled = true;
-    scrollSyncToggle.disabled = true;
+    if (scrollSyncToggle) scrollSyncToggle.disabled = true;
     retranslateBtn.disabled = true;
   }
 }
@@ -62,9 +62,12 @@ enabledToggle.addEventListener("change", () => {
   sendToContent({ type: "GDT_SET_ENABLED", enabled: enabledToggle.checked });
 });
 
-scrollSyncToggle.addEventListener("change", () => {
-  sendToContent({ type: "GDT_SET_SCROLL_SYNC", scrollSync: scrollSyncToggle.checked });
-});
+// (Absent in the side panel, which has its own scroll-sync button.)
+if (scrollSyncToggle) {
+  scrollSyncToggle.addEventListener("change", () => {
+    sendToContent({ type: "GDT_SET_SCROLL_SYNC", scrollSync: scrollSyncToggle.checked });
+  });
+}
 
 targetLangSel.addEventListener("change", async () => {
   await chrome.storage.sync.set({ targetLang: targetLangSel.value });
