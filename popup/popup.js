@@ -11,6 +11,7 @@ const backendSel = document.getElementById("backend");
 const apiKeyRow = document.getElementById("apiKeyRow");
 const apiKeyInput = document.getElementById("apiKey");
 const retranslateBtn = document.getElementById("retranslate");
+const openPanelBtn = document.getElementById("openPanel");
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -77,6 +78,15 @@ backendSel.addEventListener("change", async () => {
 
 apiKeyInput.addEventListener("change", async () => {
   await chrome.storage.sync.set({ apiKey: apiKeyInput.value });
+});
+
+// sidePanel.open() has to run straight from the click, so no awaiting
+// anything (like getActiveTab) before it.
+openPanelBtn.addEventListener("click", () => {
+  chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+    if (!isDocsTab(tab)) return;
+    chrome.sidePanel.open({ tabId: tab.id }).then(() => window.close());
+  });
 });
 
 retranslateBtn.addEventListener("click", () => {

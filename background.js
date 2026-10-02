@@ -142,3 +142,40 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 });
+
+// ---------- side panel ----------
+//
+// The translation list lives in Chrome's side panel (sidepanel/), enabled
+// only on Google Docs tabs so it never shows up on unrelated pages.
+
+const DOCS_URL_RE = /^https:\/\/docs\.google\.com\/document\//;
+
+async function syncSidePanelForTab(tabId, url) {
+  try {
+    await chrome.sidePanel.setOptions({
+      tabId,
+      path: "sidepanel/sidepanel.html",
+      enabled: DOCS_URL_RE.test(url || ""),
+    });
+  } catch (err) {
+    // tab closed while we were looking at it
+  }
+}
+
+chrome.sidePanel.setOptions({ enabled: false }).catch(() => {});
+chrome.tabs.query({}).then((tabs) => tabs.forEach((t) => syncSidePanelForTab(t.id, t.url)));
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.url || info.status === "complete") syncSidePanelForTab(tabId, tab.url);
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "GDT_OPEN_PANEL" && sender.tab) {
+    // Must be called synchronously from the message that carries the user's
+    // click — no awaiting anything first, or Chrome refuses it.
+    chrome.sidePanel
+      .open({ tabId: sender.tab.id })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
+    return true;
+  }
+});
