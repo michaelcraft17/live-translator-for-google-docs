@@ -7,22 +7,43 @@
  * `<style>` written directly into the shadow root.
  */
 
-.gdt-floating-toggle {
+/* Round icon button sitting beside Docs' own header buttons. */
+.gdt-toolbar-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin: 0 4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #444746;
+  cursor: pointer;
+}
+
+.gdt-toolbar-btn svg {
+  fill: currentColor;
+}
+
+.gdt-toolbar-btn:hover {
+  background: rgba(68, 71, 70, 0.08);
+}
+
+.gdt-toolbar-btn.gdt-on {
+  background: #d3e3fd;
+  color: #0b57d0;
+}
+
+/* Fallback when Docs' Gemini button can't be found to sit next to. */
+.gdt-toolbar-btn.gdt-floating {
   position: fixed;
-  top: 76px;
+  top: 12px;
   right: 24px;
   z-index: 10000;
-  background: #1a73e8;
-  color: #fff;
-  border: none;
-  border-radius: 20px;
-  padding: 8px 16px;
-  font-size: 13px;
-  font-family: Roboto, Arial, sans-serif;
-  cursor: pointer;
+  background: #fff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
 }
 
-.gdt-floating-toggle.gdt-off {
-  background: #5f6368;
-}
