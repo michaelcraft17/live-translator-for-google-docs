@@ -1,17 +1,75 @@
 # Google Docs Live Translator (MVP)
 
-Real-time, side-by-side translation sidebar for Google Docs with bidirectional
-sentence-click synchronization.
+Real-time, side-by-side translation for Google Docs, shown in Chrome's side
+panel, with bidirectional sentence-click synchronization.
+
+Requires Chrome 114 or newer (the Side Panel API).
 
 ## Load it
 
 1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
    select this folder.
 2. Open any Google Doc at `https://docs.google.com/document/d/…/edit`.
-3. A translation sidebar docks to the right edge of the window, and a 🌐
-   toggle button appears fixed near the top-right.
-4. Click the extension icon to change target language / translation backend
-   / API key.
+3. A round 🌐 translate button appears at the top right of the document.
+   Click it to open the translation side panel (click again to close it).
+   Chrome narrows the page to make room, the same way it does for Gemini.
+   The extension's toolbar popup has an "Open translation panel" button too.
+4. The panel header has a target-language dropdown, a scroll-sync button
+   (two Joy-Con-style bars: snapped together = syncing, pulled apart = off)
+   and a ⚙ settings gear (enabled toggle, translation backend, API key,
+   re-translate). The same settings are in the toolbar popup.
+
+Nothing is fetched or translated while the panel is closed.
+
+## The side panel
+
+The translation list lives in `sidepanel/` (a native Chrome side panel), not
+on the page. A native panel narrows the browser's real viewport, so Docs
+re-lays out its canvas around it. Doing the same from inside the page does
+not work: Docs ignores a narrowed container and synthetic `resize` events,
+and only re-lays out for a genuine window resize.
+
+- **`content/content.js` stays the source of truth.** Only it can see the
+  document, the mirror and the highlight boxes. When the panel opens it
+  connects a long-lived port (`chrome.tabs.connect`, name `gdt-panel`) and
+  the script pushes a snapshot of the paragraphs, then individual updates
+  (a sentence's translation, the active sentence, the rate-limit banner,
+  scroll position). The panel sends back sentence clicks and its own scroll
+  position.
+- **The port doubles as "is anyone looking?"** While there is no port (panel
+  closed) or translation is switched off, `refreshFromDoc()` does nothing, so
+  a closed panel costs no export fetches and no translation requests.
+- **`background.js`** enables the panel only on `docs.google.com/document/`
+  tabs and opens/closes it on request (`GDT_OPEN_PANEL` / `GDT_CLOSE_PANEL`).
+  `sidePanel.open()` must run in direct response to a click, so the page
+  button and the popup button call it with nothing awaited first.
+- **Scroll sync** is keyed by paragraph plus how far through it, in both
+  directions, over the port — not by scroll percentage.
+- **The 🌐 button** is placed from live geometry every 500 ms: just under the
+  formatting toolbar (clear of Docs' "hide the menus" chevron), at the right
+  edge, slid left past anything labelled "Gemini" so it never overlaps. It is
+  anchored by `right`, so it rides the viewport edge when the panel opens.
+  `TOOLBAR_CLEARANCE_PX` and `BUTTON_RIGHT_MARGIN_PX` in `content.js` move it.
+
+## Document tabs and page margins
+
+- **Only the open document tab is translated.** Docs' export covers every
+  tab unless told which one, so requests carry `&tab=<id>` (from the URL's
+  `?tab=`; `t.0` when absent). Switching tabs is detected by watching the
+  URL and, after a 1 s settle, drops everything from the old tab and fetches
+  the new one.
+- **Page margins come from the `.docx` export**, which stores them in
+  `w:pgMar`. The HTML export under-reports them (changed bottom/left
+  margins stayed at the 1-inch default while top/right updated), so the
+  docx values override the mirror's page box. A layout change (not just a
+  text change) also rebuilds the mirror. If the tab-specific docx request is
+  refused, the plain one is used.
+- **Page breaks follow Docs' widow/orphan control**: at least two lines of
+  a paragraph on each side of a break, otherwise the lines (or a short
+  paragraph, whole) move to the next page.
+- **Clicks resolve from Docs' own caret** (`.kix-cursor-caret`) rather than
+  the raw click pixel, so a click in the empty space right of a line, or in
+  the gap between sentences, lands on the sentence the cursor is really in.
 
 ## How it works (v2 — shadow page mirror)
 
@@ -86,8 +144,8 @@ used for caret-position measurement:
   throttle/backoff as before), and a resize listener rebuilds the mirror's
   scale/position (zoom or window-size changes invalidate it even when the
   text hasn't changed).
-- The sidebar's scroll position is kept roughly in sync with the doc's
-  scroll in both directions (proportional, not 1:1 pixels).
+- The panel's scroll position is kept in sync with the doc's in both
+  directions by paragraph (see "The side panel" above).
 
 ## Known limitations (by design — architecture over polish first)
 
@@ -336,6 +394,11 @@ console context).
 2. Navigate to `chrome-extension://<EXTENSION_ID>/test/mock-docs.html`.
 3. Use the "Dump extension state" button (or `window.__GDT_DEBUG_STATE__`
    in the console) to inspect paragraph/sentence/mirror state directly.
+
+The mock page has no side panel, so its canned-export hook
+(`__GDT_MOCK_EXPORT_HTML__`) also stands in for "a panel is open" and the
+translation list itself isn't drawn there — use the dump button to inspect
+state.
 
 Editing `content.js` only requires reloading that tab (not the extension or
 a real doc) to see changes — reload the extension in `chrome://extensions`
