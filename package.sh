@@ -21,6 +21,9 @@ zip -r -q "$out" \
   popup/popup.html \
   popup/popup.js \
   popup/popup.css \
+  sidepanel/sidepanel.html \
+  sidepanel/sidepanel.js \
+  sidepanel/sidepanel.css \
   icons/icon16.png \
   icons/icon32.png \
   icons/icon48.png \
