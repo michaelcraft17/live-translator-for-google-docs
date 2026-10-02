@@ -89,6 +89,7 @@
   // drift from Docs' own UI chrome (a "Saving…" indicator, a banner, etc.)
   // from ever accumulating enough to throw off a click.
   const REPOSITION_TICK_MS = 500;
+  const TAB_SETTLE_MS = 1000;
   const RESIZE_DEBOUNCE_MS = 300;
   const CLICK_HIT_TEST_SLOP_PX = 40; // how far a click may be from the nearest paragraph and still count
 
@@ -136,6 +137,9 @@
     headerFooter: null,
     headerFooterSignature: null,
     mirror: null,
+    lastTabId: null,
+    // Page margins/width in pt from the docx export (see fetchHeaderFooterTexts).
+    docxPage: null,
     // Extra distance the real body starts below the page's top margin,
     // which only a page header causes and only measurement can reveal
     // (see calibrateAgainstRealPage). Index 0 is page 1 — the page a
@@ -175,6 +179,20 @@
     if (window.__GDT_FORCE_DOC_ID__) return window.__GDT_FORCE_DOC_ID__;
     const m = location.pathname.match(/\/document\/d\/([^/]+)/);
     return m ? m[1] : null;
+  }
+
+  // Google Docs "document tabs": the URL carries `?tab=t.<id>` for whichever
+  // tab is open, and omits it for the first tab (always `t.0`). The export
+  // endpoint covers *every* tab unless told which one to export, so without
+  // this the panel translated the whole document instead of just the tab
+  // the user is looking at.
+  function getTabId() {
+    const m = location.search.match(/[?&]tab=([^&#]+)/);
+    return m ? decodeURIComponent(m[1]) : "t.0";
+  }
+
+  function exportUrl(docId, format) {
+    return `https://docs.google.com/document/d/${docId}/export?format=${format}&tab=${encodeURIComponent(getTabId())}`;
   }
 
   // ---------- export fetch (HTML — carries the styling the mirror needs) ----------
@@ -221,7 +239,7 @@
     }
     lastExportFetchAt = now;
 
-    const url = `https://docs.google.com/document/d/${docId}/export?format=html`;
+    const url = exportUrl(docId, "html");
     // Default ("same-origin") credentials mode: the initial request to
     // docs.google.com is same-origin so cookies are sent automatically.
     // Docs redirects internally to a signed googleusercontent.com URL that
@@ -401,7 +419,7 @@
   // HTML export's few dozen), so it's fetched on its own long throttle
   // rather than on every poll — a header changes far less often than the
   // body does.
-  const HEADER_FETCH_MIN_INTERVAL_MS = 60000;
+  const HEADER_FETCH_MIN_INTERVAL_MS = 120000;
   const ZIP_EOCD_SIGNATURE = 0x06054b50;
   const ZIP_CENTRAL_FILE_SIGNATURE = 0x02014b50;
   const ZIP_MAX_COMMENT_BYTES = 66000; // 64KB comment + the 22-byte record
@@ -481,7 +499,12 @@
     // redirects to a signed googleusercontent.com URL whose
     // `Access-Control-Allow-Origin: *` is incompatible with credentialed
     // requests, and the fetch fails outright.
-    const res = await fetch(`https://docs.google.com/document/d/${docId}/export?format=docx`);
+    // Headers, footers and page setup are document-wide, so if the
+    // tab-specific request is refused, the plain one answers the same
+    // question (observed: the `tab` variant 429ing while the plain one
+    // succeeded).
+    let res = await fetch(exportUrl(docId, "docx"));
+    if (!res.ok) res = await fetch(`https://docs.google.com/document/d/${docId}/export?format=docx`);
     if (!res.ok) throw new Error(`docx export failed: HTTP ${res.status}`);
     const bytes = new Uint8Array(await res.arrayBuffer());
     const zip = readZipDirectory(bytes);
@@ -506,9 +529,35 @@
       return out;
     };
 
+    // The HTML export under-reports page margins (observed: bottom and left
+    // stuck at the 1in default after being changed in Page setup, while top
+    // and right did update), so the docx's own page settings are the source
+    // of truth for them. A document with several sections has several
+    // `pgMar`s; the last is the body-level one.
+    let page = null;
+    const docEntry = zip.entries.find((e) => e.name === "word/document.xml");
+    if (docEntry) {
+      const xml = await readZipEntryText(bytes, zip.view, docEntry);
+      const mar = xml && Array.from(xml.matchAll(/<w:pgMar\b[^>]*>/g)).pop();
+      const sz = xml && Array.from(xml.matchAll(/<w:pgSz\b[^>]*>/g)).pop();
+      const twips = (tag, attr) => {
+        const m = tag && tag[0].match(new RegExp(`w:${attr}="(-?\\d+)"`));
+        return m ? parseInt(m[1], 10) / 20 : null;
+      };
+      const top = twips(mar, "top");
+      const right = twips(mar, "right");
+      const bottom = twips(mar, "bottom");
+      const left = twips(mar, "left");
+      const width = twips(sz, "w");
+      if ([top, right, bottom, left, width].every((v) => v !== null && v >= 0)) {
+        page = { top, right, bottom, left, width };
+      }
+    }
+
     return {
       header: await collect(/^word\/header\d*\.xml$/),
       footer: await collect(/^word\/footer\d*\.xml$/),
+      page,
     };
   }
 
@@ -863,6 +912,68 @@
   function fontKeyOf(fontFamily, fontWeight, fontStyle) {
     return `${fontFamily}|${fontWeight}|${fontStyle}`;
   }
+  // Docs registers every font it embeds under its own "docs-" prefixed
+  // family name (e.g. "docs-EB Garamond"), specifically so it never
+  // collides with a same-named font already installed on the machine.
+  // The export's CSS, being a portable snapshot, names runs with the
+  // plain, unprefixed family instead — so probing with that name doesn't
+  // necessarily hit Docs' own embedded font at all: whenever a real font
+  // of that same plain name happens to also be installed locally (common
+  // for popular Google Fonts like EB Garamond), the browser resolves the
+  // plain name to *that* font instead, and measures its metrics rather
+  // than the embedded one Docs actually laid the page out with. Measured
+  // live: "EB Garamond" resolved locally to a natural ratio of 1.15, while
+  // "docs-EB Garamond" (Docs' real embedded font) measured 1.305 — a 13.5%
+  // gap, just over calibrateAgainstRealPage's own MAX_RATIO_CORRECTION
+  // sanity cap, so calibration silently declined to correct it and
+  // reported "clean" while every line still drifted ~13% short,
+  // compounding visibly within a page's worth of lines. Preferring the
+  // "docs-" name whenever Docs has actually registered one sidesteps the
+  // collision instead of relying on calibration to catch a gap that can
+  // legitimately exceed what calibration is willing to trust.
+  function resolveMirrorFontFamily(fontFamily) {
+    const bare = (fontFamily || "").replace(/^["']|["']$/g, "");
+    if (!bare || bare.toLowerCase().startsWith("docs-")) return fontFamily;
+    if (!document.fonts) return fontFamily;
+    const prefixed = `docs-${bare}`;
+    for (const face of document.fonts) {
+      if (face.family.replace(/^["']|["']$/g, "") === prefixed) {
+        return `"${prefixed}"`;
+      }
+    }
+    return fontFamily;
+  }
+
+  // Same "docs-" preference as resolveMirrorFontFamily, but applied to every
+  // font-family declaration in the exported stylesheet itself — not just the
+  // isolated measurement probes. This stylesheet is what every mirror
+  // paragraph's real text actually renders and *wraps* with, so a plain
+  // family name that resolves locally to a different-metric font doesn't
+  // just mismeasure line height, it changes glyph advance widths and can
+  // shift word-wrap points relative to the real, canvas-rendered page: a
+  // line that wraps one word earlier or later in the mirror than on the real
+  // page throws off every rect on every subsequent line of that paragraph.
+  function rewriteFontFamiliesForMirror(styleText) {
+    if (!document.fonts) return styleText;
+    const registered = new Set();
+    for (const face of document.fonts) {
+      registered.add(face.family.replace(/^["']|["']$/g, ""));
+    }
+    return styleText.replace(/font-family:\s*([^;]+);/g, (m, list) => {
+      const rewritten = list
+        .split(",")
+        .map((name) => {
+          const trimmed = name.trim();
+          const bare = trimmed.replace(/^["']|["']$/g, "");
+          if (!bare || bare.toLowerCase().startsWith("docs-")) return trimmed;
+          const prefixed = `docs-${bare}`;
+          return registered.has(prefixed) ? `"${prefixed}"` : trimmed;
+        })
+        .join(", ");
+      return `font-family: ${rewritten};`;
+    });
+  }
+
   function measureNaturalLineHeightPx(fontFamily, fontSizePx, fontWeight, fontStyle) {
     const key = fontKeyOf(fontFamily, fontWeight, fontStyle);
     const calibrated = calibratedNaturalRatios.get(key);
@@ -874,7 +985,7 @@
       probe.style.visibility = "hidden";
       probe.style.whiteSpace = "nowrap";
       probe.style.lineHeight = "normal";
-      probe.style.fontFamily = fontFamily;
+      probe.style.fontFamily = resolveMirrorFontFamily(fontFamily);
       probe.style.fontSize = `${NATURAL_LH_PROBE_PX}px`;
       probe.style.fontWeight = fontWeight || "normal";
       probe.style.fontStyle = fontStyle || "normal";
@@ -902,19 +1013,39 @@
   //
   // Where runs disagree with each other (a paragraph mixing sizes), the
   // largest wins: that's the one that sets the line's height.
+  //
+  // Where runs are the *same* size but disagree on weight or style — a
+  // short bold label ("Feasibility (20 points): ") leading into a long
+  // regular sentence, extremely common in translated documents — size
+  // alone doesn't pick a winner. Break that tie by character count
+  // instead of by DOM order: the run holding most of the line's actual
+  // text is the one whose metrics the line was really laid out from.
+  // Encountered-first would silently prefer the label just because it
+  // comes first, even though it might be one word out of a full sentence.
+  // Confirmed on a real EB Garamond doc that regular/bold happen to share
+  // identical natural-height metrics there, so encountered-first did no
+  // damage in that case — but nothing guarantees that of every font, and
+  // Google Fonts weights routinely do carry their own hhea/OS2 metrics.
+  const FONT_SIZE_TIE_EPSILON_PX = 0.1;
   function dominantRunFont(blockEl) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
     let best = null;
+    let bestChars = 0;
     let n;
     while ((n = walker.nextNode())) {
-      if (!n.data || !n.data.trim()) continue;
+      const chars = n.data ? n.data.trim().length : 0;
+      if (!chars) continue;
       const el = n.parentElement;
       if (!el) continue;
       const cs = getComputedStyle(el);
       const fontSizePx = parseFloat(cs.fontSize);
       if (!fontSizePx) continue;
-      if (!best || fontSizePx > best.fontSizePx) {
+      if (!best || fontSizePx > best.fontSizePx + FONT_SIZE_TIE_EPSILON_PX) {
         best = { fontSizePx, fontFamily: cs.fontFamily, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle };
+        bestChars = chars;
+      } else if (Math.abs(fontSizePx - best.fontSizePx) <= FONT_SIZE_TIE_EPSILON_PX && chars > bestChars) {
+        best = { fontSizePx, fontFamily: cs.fontFamily, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle };
+        bestChars = chars;
       }
     }
     if (best) return best;
@@ -1177,6 +1308,53 @@
     }
     if (!splitNode) return null; // everything fits — caller keeps it whole
 
+    // Widow/orphan control. Docs (by default) never leaves a lone line of a
+    // paragraph at the bottom of a page or at the top of the next: it needs
+    // at least two lines on each side of a break, and otherwise moves the
+    // line(s) over — or the whole paragraph, when it is only two or three
+    // lines long. A plain "split wherever the page runs out" put the first
+    // line of a two-line bullet at the foot of page 1 while Docs had moved
+    // the entire bullet to page 2, so its highlight landed in the blank
+    // space below the previous paragraph.
+    const MIN_LINES_EACH_SIDE = 2;
+    if (lineHeightPx > 0) {
+      const padTop = parseFloat(cs.paddingTop) || 0;
+      const padBottom = parseFloat(cs.paddingBottom) || 0;
+      const leafRect = leafEl.getBoundingClientRect();
+      const leafTop = leafRect.top + padTop;
+      const totalLines = Math.round((leafRect.height - padTop - padBottom) / lineHeightPx);
+      const lineIndexAt = (node, i) => {
+        const r = document.createRange();
+        r.setStart(node, i);
+        r.setEnd(node, i + 1);
+        const rs = r.getClientRects();
+        return rs.length ? Math.round((rs[0].top - leafTop) / lineHeightPx) : null;
+      };
+      const firstLine = lineIndexAt(splitNode, splitOffset);
+      if (firstLine !== null && totalLines >= 2) {
+        let keep = firstLine; // lines that stay on this page
+        if (totalLines - keep < MIN_LINES_EACH_SIDE) keep = totalLines - MIN_LINES_EACH_SIDE;
+        if (keep < MIN_LINES_EACH_SIDE) {
+          return { firstPart: null, secondPart: leafEl };
+        }
+        if (keep !== firstLine) {
+          let found = false;
+          outer2: for (const node of textNodes) {
+            for (let i = 0; i < node.data.length; i++) {
+              const idx = lineIndexAt(node, i);
+              if (idx !== null && idx >= keep) {
+                splitNode = node;
+                splitOffset = i;
+                found = true;
+                break outer2;
+              }
+            }
+          }
+          if (!found) return { firstPart: null, secondPart: leafEl };
+        }
+      }
+    }
+
     if (splitNode === textNodes[0] && splitOffset === 0) {
       // Not even the first character fits — the whole leaf belongs on
       // the next page, not split at all.
@@ -1247,7 +1425,7 @@
   // measurably wrong but corrupted every leaf *after* it too (see
   // placeLeaf's own note on overflow carry-over) — splitting the leaf for
   // real, rather than approximating around it, removes both problems.
-  function paginateBlocks(scratch, pageContainers, printableHeightsPx) {
+  function paginateBlocks(scratch, pageContainers, printableHeightsPx, placementLog) {
     let pageIndex = 0;
     let usedHeight = 0;
     const listCloneCache = new Map(); // original <ul>/<ol> -> { pageIndex, cloneEl }
@@ -1304,6 +1482,18 @@
       // reflow it.
       const h = leafEl.getBoundingClientRect().height;
       usedHeight += h;
+      // TEMP DIAGNOSTIC (see debugging session) — see rebuildMirror's
+      // gdtMirrorStats note. Safe to delete once the drift is found.
+      if (placementLog) {
+        placementLog.push({
+          tag: leafEl.tagName,
+          idx: leafEl.dataset.gdtParaIndex,
+          text: (leafEl.textContent || "").slice(0, 30),
+          h: Math.round(h * 100) / 100,
+          cumulative: Math.round(usedHeight * 100) / 100,
+          pageIndex,
+        });
+      }
 
       while (pageIndex < pageContainers.length - 1) {
         const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
@@ -1338,8 +1528,33 @@
           if (split.secondPart) placeLeaf(split.secondPart, listChain); // may itself need further splitting
           return;
         }
-        // splitLeafAtHeight found no usable boundary (e.g. no text at
-        // all) — fall through to the whole-block carry-over path below.
+        // splitLeafAtHeight returned null. Its own "everything fits"
+        // fast path (see its comment) tests each line by *ink* height,
+        // with a small rounding tolerance — deliberately lenient, since
+        // Docs really does let a page's very last line's leading spill
+        // past the bottom margin. But we only ever get here because `h >
+        // remaining` already said this leaf's full box does NOT fit — so
+        // a null return doesn't mean "comfortably fits", it means "the
+        // shortfall is small enough (at most that leading-plus-rounding
+        // slop, never more) that no line boundary crossed the threshold".
+        // Confirmed against a real document: a 3-line paragraph over
+        // budget by a fraction of a pixel — under that tolerance — took
+        // this path and was kept in full on the current page, while
+        // Google Docs itself moved the whole paragraph to the next page,
+        // leaving that last sliver of the current page blank rather than
+        // let it spill. The leading-spill leniency is for a line that's
+        // already mid-paragraph on this page (nothing else needs that
+        // space); it doesn't extend to deciding whether a paragraph gets
+        // to *start* on this page at all. So: treat this exactly like
+        // the "not even the first character fits" case above and move
+        // the whole, unsplit leaf to the next page — never let it spill
+        // on a technicality only the ink-based check would forgive.
+        if (remaining > 0) {
+          pageIndex += 1;
+          usedHeight = 0;
+          placeLeaf(leafEl, listChain);
+          return;
+        }
       }
       placeWhole(leafEl, listChain);
     }
@@ -1398,6 +1613,28 @@
   // there to fix, and on a document that needs no correction at all this
   // has to be a no-op.
   const BLOCK_LINE_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li";
+  // `BLOCK_LINE_SELECTOR` alone also matches a table cell's own `<p>` —
+  // confirmed live: Google's export wraps every `<td>`'s text in one
+  // (`<td><p class="c6"><span>...</span></p></td>`). `extractBlockNodes`
+  // already excludes these (`!node.closest("table")`, since a table is a
+  // single atomic block — see paginateBlocks), but code that queries
+  // `BLOCK_LINE_SELECTOR` directly does not, and a table's cells sit
+  // *inside* the same DOM subtree as the real flow blocks, interleaved
+  // with them in document order. Feeding those phantom blocks to
+  // `collapseAdjacentBlockSpacing`/`normalizeBlockEl` — meant to run over
+  // the *vertical reading order* of the page — treats side-by-side cells
+  // as vertically adjacent and lets the "next real paragraph after the
+  // table" collapse its spacing against a table cell instead of the table
+  // itself, corrupting the table's own measured height in the process.
+  // Measured live on a document with two tables ahead of a bulleted
+  // section: the mirror ran ~200px short of the real canvas by the time
+  // it reached that section, which is exactly this — a table rendering
+  // shorter in the mirror than for real, silently pulling every paragraph
+  // after it up by the shortfall until a click several bullets in landed
+  // on a different bullet's mirror box entirely.
+  function flowBlocksIn(root) {
+    return Array.from(root.querySelectorAll(BLOCK_LINE_SELECTOR)).filter((el) => !el.closest("table"));
+  }
   const INK_DARK_MAX = 200;
   const MAX_CALIBRATION_PASSES = 3;
   const MIN_RATIO_SAMPLES = 4; // line gaps, not paragraphs
@@ -1463,7 +1700,7 @@
   // it belongs to so consecutive-line spacing can be attributed to a font.
   function mirrorLinesForPage(containerEl, pageTopPx) {
     const lines = [];
-    for (const blockEl of containerEl.querySelectorAll(BLOCK_LINE_SELECTOR)) {
+    for (const blockEl of flowBlocksIn(containerEl)) {
       const range = document.createRange();
       range.selectNodeContents(blockEl);
       const rects = Array.from(range.getClientRects())
@@ -1494,7 +1731,19 @@
     if (!inkProbeCtx) inkProbeCtx = document.createElement("canvas").getContext("2d");
     if (!inkProbeCtx) return null;
     const cs = getComputedStyle(blockEl);
-    inkProbeCtx.font = `${cs.fontStyle} ${cs.fontWeight} ${parseFloat(cs.fontSize)}px ${cs.fontFamily}`;
+    // Font *family* has to come from the run gdtFontKey recorded (see
+    // dominantRunFont/normalizeBlockEl), not the block's own computed
+    // style: the block itself was never given an explicit font-family (only
+    // font-size and line-height are copied onto it), so getComputedStyle
+    // reports whatever it inherits — measured on a real block as "Arial"
+    // while its own text actually rendered in "EB Garamond". Probing with
+    // the wrong family measures the wrong font's ascent metrics, which
+    // feeds directly into originShift below.
+    const [runFamily, runWeight, runStyle] = (blockEl.dataset.gdtFontKey || "").split("|");
+    const fontFamily = resolveMirrorFontFamily(runFamily || cs.fontFamily);
+    const fontWeight = runWeight || cs.fontWeight;
+    const fontStyle = runStyle || cs.fontStyle;
+    inkProbeCtx.font = `${fontStyle} ${fontWeight} ${parseFloat(cs.fontSize)}px ${fontFamily}`;
     const m = inkProbeCtx.measureText(text.slice(0, 200));
     if (!(m.fontBoundingBoxAscent >= 0) || !(m.actualBoundingBoxAscent >= 0)) return null;
     return m.fontBoundingBoxAscent - m.actualBoundingBoxAscent;
@@ -1765,8 +2014,25 @@
     const anchor = ensureHostAnchored(host);
 
     const metricsPt = extractPageBoxMetricsPt(state.lastStyleText, state.lastBodyClassAttr);
+    const dp = state.docxPage;
+    if (dp) {
+      metricsPt.paddingTop = dp.top;
+      metricsPt.paddingRight = dp.right;
+      metricsPt.paddingBottom = dp.bottom;
+      metricsPt.paddingLeft = dp.left;
+      metricsPt.maxWidth = dp.width - dp.left - dp.right;
+    }
     const pxPerPt = computePxPerPt(metricsPt, layout.width);
-    styleEl.textContent = scaleStyleTextPtToPx(state.lastStyleText, pxPerPt);
+    let scaledStyle = rewriteFontFamiliesForMirror(scaleStyleTextPtToPx(state.lastStyleText, pxPerPt));
+    if (dp) {
+      // Beats the export's own page-box rule, which carries stale margins.
+      const sel = (state.lastBodyClassAttr || "").split(/\s+/).filter(Boolean).map((c) => `.${CSS.escape(c)}`).join("");
+      if (sel) {
+        const px = (v) => `${(v * pxPerPt).toFixed(3)}px`;
+        scaledStyle += `\n${sel}{padding:${px(dp.top)} ${px(dp.right)} ${px(dp.bottom)} ${px(dp.left)} !important;max-width:${px(metricsPt.maxWidth)} !important}`;
+      }
+    }
+    styleEl.textContent = scaledStyle;
 
     // Every page in a Docs document has the same box, so one printable
     // height covers all of them — including the ones not currently
@@ -1797,7 +2063,7 @@
     for (const child of Array.from(state.lastBodyNode.children)) {
       scratch.appendChild(document.importNode(child, true));
     }
-    const flowBlocks = scratch.querySelectorAll(BLOCK_LINE_SELECTOR);
+    const flowBlocks = flowBlocksIn(scratch);
     collapseAdjacentBlockSpacing(flowBlocks);
     flowBlocks.forEach(normalizeBlockEl);
 
@@ -1811,7 +2077,13 @@
       node.dataset.gdtParaIndex = String(i);
     });
 
-    paginateBlocks(scratch, containers, printableHeightsPx);
+    const placementLog = [];
+    paginateBlocks(scratch, containers, printableHeightsPx, placementLog);
+    try {
+      host.dataset.gdtPlacementLog = JSON.stringify(placementLog);
+    } catch (e) {
+      host.dataset.gdtPlacementLog = "ERROR: " + (e && e.message);
+    }
 
     // Re-discover every fragment across all page containers, in page
     // order, grouped by the index tagged above — one paragraph now maps
@@ -1838,6 +2110,71 @@
       }
     });
 
+    // TEMP DIAGNOSTIC (see debugging session): surfaces per-rebuild
+    // paragraph/mirror consistency onto the host's dataset, since that's
+    // readable from the page's own JS world even though this content
+    // script's closures aren't (isolated world). Safe to delete once the
+    // click-resolution bug is found.
+    try {
+      const bodyParas = state.paragraphs.filter((p) => p.place === "body");
+      const emptyMirror = bodyParas.filter((p) => !p.mirrorEls || !p.mirrorEls.length).length;
+      host.dataset.gdtMirrorStats = JSON.stringify({
+        rebuildAt: Date.now(),
+        totalBody: bodyParas.length,
+        emptyMirror,
+        fragmentsByIndexSize: fragmentsByIndex.size,
+        sample: bodyParas
+          .filter((p) => [2, 56, 57, 58, 60, 61].includes(p.bodyIndex))
+          .map((p) => ({
+            id: p.id,
+            bodyIndex: p.bodyIndex,
+            mirrorCount: (p.mirrorEls || []).length,
+            taggedIndexOnEl:
+              p.mirrorEls && p.mirrorEls[0] ? p.mirrorEls[0].dataset.gdtParaIndex : null,
+            text: p.text.slice(0, 30),
+          })),
+      });
+    } catch (e) {
+      host.dataset.gdtMirrorStats = "ERROR: " + (e && e.message);
+    }
+
+    // TEMP DIAGNOSTIC — checks whether extractBlockNodes(state.lastBodyNode)
+    // (the pristine tree, used by buildParagraphsFromBlocks to assign
+    // bodyIndex/text) still lines up 1:1 with the body paragraphs currently
+    // held in state.paragraphs. If it diverges anywhere, that's the index
+    // shift causing the wrong translation to highlight. Safe to delete once
+    // the bug is found.
+    try {
+      const freshBlocks = extractBlockNodes(state.lastBodyNode);
+      const freshTexts = freshBlocks.map((n) => textOfBlock(n));
+      const bodyParas = state.paragraphs.filter((p) => p.place === "body");
+      let firstMismatch = -1;
+      for (let i = 0; i < Math.max(freshTexts.length, bodyParas.length); i++) {
+        const a = freshTexts[i];
+        const b = bodyParas[i] ? bodyParas[i].text : undefined;
+        if (a !== b) {
+          firstMismatch = i;
+          break;
+        }
+      }
+      host.dataset.gdtIndexCheck = JSON.stringify({
+        freshCount: freshTexts.length,
+        bodyParaCount: bodyParas.length,
+        firstMismatch,
+        around:
+          firstMismatch >= 0
+            ? {
+                freshBefore: freshTexts.slice(Math.max(0, firstMismatch - 2), firstMismatch + 3),
+                paraBefore: bodyParas
+                  .slice(Math.max(0, firstMismatch - 2), firstMismatch + 3)
+                  .map((p) => ({ id: p.id, bodyIndex: p.bodyIndex, text: p.text })),
+              }
+            : null,
+      });
+    } catch (e) {
+      host.dataset.gdtIndexCheck = "ERROR: " + (e && e.message);
+    }
+
     containers.forEach((c, i) => positionPageContainer(c, pageRects[i], anchor));
     lastRepositionWidth = Math.round(layout.width);
     lastPageCount = layout.count;
@@ -1852,6 +2189,45 @@
     if (calibrationPass < MAX_CALIBRATION_PASSES) {
       scheduleCalibration(contentTopPx, CALIBRATION_FIRST_DELAY_MS);
     }
+  }
+
+  // A webfont Docs embeds can still be mid-download the moment the mirror
+  // is first built and measured — Docs calls `document.fonts.add()`
+  // synchronously when it registers a face, so `document.fonts` already
+  // contains it (which is all resolveMirrorFontFamily/
+  // rewriteFontFamiliesForMirror check for), but the face's own `status`
+  // can still be "unloaded"/"loading" at that instant. Both the metrics
+  // probe in measureNaturalLineHeightPx and the mirror's real text then
+  // render with whatever fallback font the browser substitutes meanwhile —
+  // silently, since membership in `document.fonts` isn't the same as being
+  // ready to paint. Worse, that wrong probe result is cached forever (see
+  // naturalLineHeightRatioCache) and nothing ever re-measures it:
+  // rebuildMirror() only re-runs when the document's *text* changes (see
+  // refreshFromDoc), so a document whose text never changes after this race
+  // is stuck with one permanently-wrong measurement for that font, for the
+  // rest of the session. A whole different font's metrics is usually a big
+  // enough gap to exceed calibrateAgainstRealPage's own
+  // MAX_RATIO_CORRECTION sanity cap too — the same reason the plain-vs-
+  // "docs-" name collision went uncorrected before resolveMirrorFontFamily
+  // existed — so calibration silently declines to fix it as well. Far more
+  // likely on a document's CJK font than its Latin ones: Docs subsets CJK
+  // embeds to the characters actually used and they're larger downloads,
+  // so they're more likely to still be loading when a short document's
+  // first (and, absent this, only) mirror build happens.
+  //
+  // `loadingdone` fires every time a batch of requested fonts finishes
+  // downloading, for the life of the page — not just once at startup — so
+  // this also covers a font Docs registers later. Debounced because Docs
+  // can add several faces in quick succession, each firing its own event.
+  function invalidateFontMetricsAndRebuild() {
+    if (!naturalLineHeightRatioCache.size && !calibratedNaturalRatios.size) return;
+    naturalLineHeightRatioCache.clear();
+    calibratedNaturalRatios.clear();
+    if (!state.lastBodyNode) return;
+    calibrationPass = 0;
+    calibrationRetries = 0;
+    rebuildMirror();
+    if (state.activeHighlight) renderHighlightBoxes();
   }
 
   // Cheap, frequent counterpart to rebuildMirror(): re-measures the real
@@ -1940,6 +2316,29 @@
       }
       ranges.push([idx, idx + s.length]);
       cursor = idx + s.length;
+    }
+
+    // Sentence text (as split for translation) doesn't include the
+    // whitespace between sentences, so back-to-back ranges built directly
+    // from indexOf leave that gap claimed by neither sentence — a click
+    // landing in it (e.g. right at the start of the next sentence's first
+    // word, where the mirror's own measurement can be a pixel or two off
+    // from the real page) falls through to getSentenceClientRects' nearest-
+    // rect fallback with no rect of its own to prefer, and can resolve to
+    // the wrong sentence. Extending each range to start where the previous
+    // one ended (and the last to run to the end of the text) closes every
+    // gap, so every character position — including inter-sentence spaces —
+    // is unambiguously claimed by exactly one sentence.
+    // The gap goes to the sentence *before* it: a caret just before the
+    // space is still at the end of that sentence, and only a caret after
+    // the space (immediately before the next sentence's first letter) is in
+    // the next one.
+    for (let i = 0; i + 1 < ranges.length; i++) {
+      ranges[i][1] = ranges[i + 1][0];
+    }
+    if (ranges.length) {
+      ranges[0][0] = 0;
+      ranges[ranges.length - 1][1] = fullText.length;
     }
 
     // Split each text node at every sentence boundary that falls strictly
@@ -2311,7 +2710,15 @@
       for (const mirrorEl of p.mirrorEls || []) {
         const r = mirrorEl.getBoundingClientRect();
         if (r.width <= 0 && r.height <= 0) continue;
-        const inside = clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+        // Half-open on the bottom/right edge: two vertically (or
+        // horizontally) stacked rects that share a boundary — e.g.
+        // consecutive lines of mirrored text — otherwise both claim that
+        // exact boundary pixel as "inside", and whichever paragraph is
+        // checked first (array order) always wins the tie regardless of
+        // which line the click actually landed on. Confirmed live: a click
+        // exactly on the pixel where one line ends and the next begins
+        // resolved to the wrong (earlier-checked) paragraph every time.
+        const inside = clientX >= r.left && clientX < r.right && clientY >= r.top && clientY < r.bottom;
         if (inside) return { paragraph: p, dist: 0 };
         const vGap = clientY < r.top ? r.top - clientY : clientY > r.bottom ? clientY - r.bottom : 0;
         const hGap = clientX < r.left ? r.left - clientX : clientX > r.right ? clientX - r.right : 0;
@@ -2330,21 +2737,44 @@
     if (!paragraph.sentences.length) return -1;
     if (paragraph.sentences.length === 1 || paragraph.kind === "row") return 0;
 
+    // Among every rect the click's x falls inside, pick the one whose
+    // *vertical center* is closest to the click, rather than the first rect
+    // whose top/bottom edges happen to contain it. The mirror's own line
+    // edges can be off from the real page's by a pixel or two (font-metric
+    // rounding the calibration pass didn't flag as worth correcting), and a
+    // click near where two lines meet can fall just inside the wrong
+    // neighbor's edge-based box even after the boundary is made half-open —
+    // its center is far more stable, since both lines' small edge errors
+    // point the same direction and mostly cancel out there. Confirmed live:
+    // a click square in the middle of "tracks" (end of one sentence)
+    // resolved to the next sentence because the mirror's line boundary sat
+    // ~1px above where that word actually renders.
     const rectsBySentence = getSentenceClientRects(paragraph);
+    let bestInsideIdx = -1;
+    let bestInsideDist = Infinity;
     for (let i = 0; i < rectsBySentence.length; i++) {
       for (const r of rectsBySentence[i]) {
-        if (clientX >= r.left && clientX <= r.left + r.width && clientY >= r.top && clientY <= r.top + r.height) {
-          return i;
+        if (clientX < r.left || clientX >= r.left + r.width) continue;
+        const centerY = r.top + r.height / 2;
+        const dist = Math.abs(clientY - centerY);
+        if (dist < bestInsideDist) {
+          bestInsideDist = dist;
+          bestInsideIdx = i;
         }
       }
     }
+    if (bestInsideIdx !== -1) return bestInsideIdx;
+
     let best = -1;
     let bestDist = Infinity;
     rectsBySentence.forEach((rects, i) => {
       for (const r of rects) {
-        const vGap = clientY < r.top ? r.top - clientY : clientY > r.top + r.height ? clientY - (r.top + r.height) : 0;
+        // Vertical distance to the line's center, not its edges: two lines
+        // sharing a boundary both have a 0 edge gap there, and the tie was
+        // going to whichever sentence came first.
+        const vDist = Math.abs(clientY - (r.top + r.height / 2));
         const hGap = clientX < r.left ? r.left - clientX : clientX > r.left + r.width ? clientX - (r.left + r.width) : 0;
-        const dist = vGap * 1000 + hGap;
+        const dist = vDist * 1000 + hGap;
         if (dist < bestDist) {
           bestDist = dist;
           best = i;
@@ -2354,18 +2784,90 @@
     return best;
   }
 
+  // After a click, Docs snaps its own caret (`.kix-cursor-caret`, a real
+  // DOM element with real on-screen geometry) to the nearest character
+  // boundary. That boundary — not the raw click pixel — is what the reader
+  // means by "this sentence": a click in the empty space right of a line's
+  // last word puts the caret at the end of that line, and a click on the
+  // gap between two sentences puts it on one side of it, while the raw
+  // coordinates are in neither place. So resolve the sentence from the
+  // character just after the caret, falling back to the click itself when
+  // there is no caret near it (clicks that don't place one).
+  const CARET_SETTLE_MS = 60;
+  const CARET_MAX_DRIFT_PX = 30;
+  function caretProbePoint(clickX, clickY) {
+    let best = null;
+    for (const el of document.querySelectorAll(".kix-cursor-caret")) {
+      const r = el.getBoundingClientRect();
+      if (!(r.height > 0)) continue;
+      const centerY = r.top + r.height / 2;
+      const d = Math.abs(centerY - clickY);
+      if (d > CARET_MAX_DRIFT_PX) continue;
+      if (!best || d < best.d) best = { d, x: r.left + 2, y: centerY };
+    }
+    return best;
+  }
+
   function onOriginalClick(event) {
     if (!state.enabled) return;
     if (event.target.closest("#gdt-translation-panel, #gdt-floating-toggle")) return;
+    const clickX = event.clientX;
+    const clickY = event.clientY;
+    setTimeout(() => {
+      const probe = caretProbePoint(clickX, clickY);
+      handleOriginalClickAt(probe ? probe.x : clickX, probe ? probe.y : clickY);
+    }, CARET_SETTLE_MS);
+  }
 
-    const found = findParagraphForClick(event.clientX, event.clientY);
+  function handleOriginalClickAt(clientX, clientY) {
+
+    const found = findParagraphForClick(clientX, clientY);
+    // TEMP DIAGNOSTIC — see rebuildMirror's gdtMirrorStats note.
+    try {
+      if (state.mirror && state.mirror.host) {
+        state.mirror.host.dataset.gdtLastClick = JSON.stringify({
+          at: Date.now(),
+          clientX: clientX,
+          clientY: clientY,
+          foundId: found ? found.paragraph.id : null,
+          foundBodyIndex: found ? found.paragraph.bodyIndex : null,
+          dist: found ? found.dist : null,
+          foundMirrorElTaggedIndex:
+            found && found.paragraph.mirrorEls && found.paragraph.mirrorEls[0]
+              ? found.paragraph.mirrorEls[0].dataset.gdtParaIndex
+              : null,
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
     if (!found || found.dist > CLICK_HIT_TEST_SLOP_PX) return;
     const { paragraph } = found;
     if (!paragraph.sentences.length) return;
 
-    const sIdx = findSentenceIndexForClick(paragraph, event.clientX, event.clientY);
+    const sIdx = findSentenceIndexForClick(paragraph, clientX, clientY);
     if (sIdx < 0) return;
     const sentence = paragraph.sentences[sIdx];
+
+    // TEMP DIAGNOSTIC — checks whether paragraph.panelEl actually belongs to
+    // this same paragraph (its own text should match paragraph.text). Safe
+    // to delete once the bug is found.
+    try {
+      if (state.mirror && state.mirror.host) {
+        state.mirror.host.dataset.gdtPanelCheck = JSON.stringify({
+          paragraphId: paragraph.id,
+          paragraphText: paragraph.text.slice(0, 60),
+          sentenceCount: paragraph.sentences.length,
+          sIdx,
+          sentenceId: sentence.id,
+          sentenceText: (sentence.text || "").slice(0, 60),
+          panelElParagraphId: paragraph.panelEl ? paragraph.panelEl.dataset.gdtParagraphId : null,
+          panelElText: paragraph.panelEl ? paragraph.panelEl.textContent.slice(0, 60) : null,
+        });
+      }
+    } catch (e) {
+      // ignore
+    }
 
     highlightOriginal(paragraph, sIdx);
     highlightTranslatedSentence(paragraph, sentence);
@@ -2390,6 +2892,9 @@
 
   async function refreshFromDoc() {
     if (!state.docId) return;
+    // Nobody is looking at this browser tab, so there's nothing to keep
+    // current — and every export request counts against the rate limit.
+    if (document.hidden) return;
 
     let html;
     try {
@@ -2406,9 +2911,15 @@
     const { styleText, bodyNode } = parseExportedDocument(html);
     const blocks = extractBlockNodes(bodyNode);
     const texts = blocks.map(textOfBlock);
-    const signature = texts.join("");
+    // Layout counts as a change too: the mirror's geometry comes from the
+    // export's stylesheet and page-box class (margins, page size, spacing),
+    // so a margin edit with identical text must still rebuild the mirror.
+    const signature = [bodyNode.getAttribute("class") || "", styleText, texts.join("\u0001")].join("\u0002");
 
     if (signature === state.lastSignature) {
+      // Margins only live in the docx, so look there even when the body is
+      // unchanged (self-throttled; see HEADER_FETCH_MIN_INTERVAL_MS).
+      void refreshHeaderFooter();
       return;
     }
 
@@ -2423,6 +2934,7 @@
 
     state.paragraphs = composeParagraphs(bodyParagraphs);
     state.lastSignature = signature;
+    state.lastTabId = getTabId();
     state.lastBodyNode = bodyNode;
     state.lastStyleText = styleText;
     state.lastBodyClassAttr = bodyNode.getAttribute("class") || "";
@@ -2434,6 +2946,23 @@
     // Deliberately not awaited: the header is a separate, much bigger
     // download, and the body shouldn't wait on it to appear.
     void refreshHeaderFooter();
+  }
+
+  // The user switched to a different document tab: drop everything built from
+  // the previous tab (so none of its text or translations carry over by
+  // position) and fetch the new one immediately, past the usual throttles.
+  function onTabChanged() {
+    clearOriginalHighlight();
+    state.paragraphs = [];
+    state.lastSignature = null;
+    state.headerFooter = null;
+    state.headerFooterSignature = null;
+    state.docxPage = null;
+    lastHeaderFetchAt = 0; // margins can differ per tab; fetch them for this one
+    // Throttle/backoff are left alone on purpose: a switch must not be a
+    // way around an active rate limit.
+    renderPanelFull();
+    void refreshFromDoc();
   }
 
   // Pulls the header/footer text (see fetchHeaderFooterTexts) and, if it
@@ -2452,8 +2981,14 @@
     if (!texts) return; // throttled or backing off; nothing to do
     const signature = JSON.stringify(texts);
     if (signature === state.headerFooterSignature) return;
+    const pageChanged = JSON.stringify(texts.page) !== JSON.stringify(state.docxPage);
     state.headerFooter = texts;
     state.headerFooterSignature = signature;
+    state.docxPage = texts.page;
+    if (pageChanged && state.lastBodyNode) {
+      clearOriginalHighlight();
+      rebuildMirror();
+    }
     if (!texts.header.length && !texts.footer.length) return;
 
     // The body paragraph objects are carried across untouched, so their
@@ -2678,12 +3213,31 @@
     await refreshFromDoc();
     setupScrollSync();
 
+    // See invalidateFontMetricsAndRebuild's own note: catches a webfont
+    // that was still downloading at the measurements above.
+    if (document.fonts) {
+      document.fonts.addEventListener("loadingdone", debounce(invalidateFontMetricsAndRebuild, 300));
+    }
+
     document.addEventListener("click", onOriginalClick, true);
     document.addEventListener("click", (e) => {
       if (e.target.closest("#gdt-translation-panel")) onPanelClick(e);
     });
 
     setInterval(refreshFromDoc, REFRESH_POLL_MS);
+    // Switching document tabs only changes the URL (no page load), so watch
+    // for it and start over with the newly selected tab's content.
+    let watchedTabId = getTabId();
+    let tabSettleTimer = null;
+    setInterval(() => {
+      const tabId = getTabId();
+      if (tabId === watchedTabId) return;
+      watchedTabId = tabId;
+      // Wait for the user to settle on a tab, so flicking through several
+      // tabs costs one export request instead of one per tab passed.
+      clearTimeout(tabSettleTimer);
+      tabSettleTimer = setTimeout(onTabChanged, TAB_SETTLE_MS);
+    }, 500);
     setInterval(repositionMirrorTick, REPOSITION_TICK_MS);
 
     window.addEventListener(
