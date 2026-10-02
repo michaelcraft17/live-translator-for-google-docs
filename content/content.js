@@ -3027,10 +3027,8 @@
 
   // ---------- floating toggle button ----------
 
-  // A round icon button in the Docs top bar, next to "Ask Gemini", that
-  // toggles the translation side panel the way that button toggles Gemini's.
-  // Docs rebuilds parts of its header from time to time and would drop a
-  // node it didn't make, so placeFloatingButton() re-attaches it on a timer.
+  // A round icon button at the top right of Docs that toggles the
+  // translation side panel the way "Ask Gemini" toggles Gemini's.
   const TRANSLATE_ICON_PATH =
     "M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z";
 
@@ -3038,7 +3036,7 @@
     if (state.floatingBtn) return;
     const btn = document.createElement("button");
     btn.id = "gdt-floating-toggle";
-    btn.className = "gdt-toolbar-btn";
+    btn.className = "gdt-toolbar-btn gdt-floating";
     btn.type = "button";
     btn.title = "Translate";
     btn.setAttribute("aria-label", "Translate");
@@ -3055,30 +3053,66 @@
     });
     state.floatingBtn = btn;
     placeFloatingButton();
-    setInterval(placeFloatingButton, 1500);
+    setInterval(placeFloatingButton, 500);
+    window.addEventListener("resize", debounce(placeFloatingButton, 100));
+  }
+
+  // Docs' header changes shape with its state — with the menus shown there
+  // are two rows and Gemini's button sits in the first, with them hidden it
+  // is one row and everything moves — so a fixed offset can't stay clear of
+  // it. Instead, every tick: park the button in the formatting toolbar's row
+  // at the right edge, then slide it left past anything Gemini-labelled that
+  // it would otherwise overlap.
+  const BUTTON_SIZE_PX = 40;
+  const BUTTON_GAP_PX = 8;
+  const HEADER_SCAN_PX = 160; // Gemini's buttons live in the header, never lower
+
+  function headerObstacles(btn) {
+    const out = [];
+    for (const el of document.querySelectorAll("button, [role='button'], [aria-label], [data-tooltip]")) {
+      if (el === btn || btn.contains(el)) continue;
+      const label = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-tooltip") || ""} ${
+        el.childElementCount === 0 ? el.textContent || "" : ""
+      }`;
+      if (!/gemini/i.test(label)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.top < HEADER_SCAN_PX) out.push(r);
+    }
+    return out;
   }
 
   function placeFloatingButton() {
     const btn = state.floatingBtn;
     if (!btn) return;
-    const gemini = Array.from(document.querySelectorAll('[aria-label*="Gemini" i]')).find(
-      (el) => el !== btn && el.getBoundingClientRect().width > 0
-    );
-    // The button itself may be wrapped (Docs wraps its toolbar buttons);
-    // sit beside the outermost wrapper that still lives in the same row.
-    let anchor = gemini;
-    while (anchor && anchor.parentElement && anchor.parentElement.children.length === 1) {
-      anchor = anchor.parentElement;
-    }
-    if (anchor && anchor.parentElement) {
-      btn.classList.remove("gdt-floating");
-      if (btn.nextElementSibling !== anchor) anchor.parentElement.insertBefore(btn, anchor);
-    } else {
-      // Gemini's button not found: a fixed spot at the top right still works.
-      btn.classList.add("gdt-floating");
-      if (btn.parentElement !== document.body) document.body.appendChild(btn);
-    }
+    if (btn.parentElement !== document.body) document.body.appendChild(btn);
     btn.classList.toggle("gdt-on", !!state.sidePanelPort);
+
+    const toolbar = document.querySelector("#docs-toolbar");
+    const tr = toolbar ? toolbar.getBoundingClientRect() : null;
+    const top =
+      tr && tr.height > 0 && tr.top < HEADER_SCAN_PX
+        ? Math.round(tr.top + (tr.height - BUTTON_SIZE_PX) / 2)
+        : 12;
+    let left = window.innerWidth - 24 - BUTTON_SIZE_PX;
+    const obstacles = headerObstacles(btn);
+    // Each move can land on another obstacle, so settle over a few passes.
+    for (let pass = 0; pass < 4; pass++) {
+      let moved = false;
+      for (const o of obstacles) {
+        const clashes =
+          left < o.right + BUTTON_GAP_PX &&
+          left + BUTTON_SIZE_PX > o.left - BUTTON_GAP_PX &&
+          top < o.bottom &&
+          top + BUTTON_SIZE_PX > o.top;
+        if (clashes) {
+          left = Math.round(o.left - BUTTON_GAP_PX - BUTTON_SIZE_PX);
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    btn.style.top = `${top}px`;
+    btn.style.left = `${left}px`;
   }
 
   function setEnabled(enabled) {
