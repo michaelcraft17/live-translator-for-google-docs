@@ -104,6 +104,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   width: 32px;
   height: 32px;
   padding: 0;
@@ -175,6 +176,8 @@ body {
 }
 
 .gdt-panel-tools {
+  width: 100%;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -183,7 +186,8 @@ body {
 }
 
 .gdt-panel-tools select {
-  max-width: 140px;
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   padding: 3px 4px;
   border: 1px solid #dadce0;
@@ -221,4 +225,18 @@ body {
 
 .gdt-icon-btn.gdt-off .gdt-joycon-left {
   transform: translateY(-2px);
+}
+
+.gdt-feedback {
+  flex: 0 0 auto;
+  padding: 10px 16px;
+  border-top: 1px solid #eee;
+  color: #5f6368;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.gdt-feedback a {
+  color: #0b57d0;
+  overflow-wrap: anywhere;
 }

@@ -3,7 +3,7 @@
 Real-time, side-by-side translation for Google Docs, shown in Chrome's side
 panel, with bidirectional sentence-click synchronization.
 
-Requires Chrome 114 or newer (the Side Panel API).
+Requires Chrome 116 or newer (required to open the side panel from a click).
 
 ## Load it
 
@@ -14,10 +14,12 @@ Requires Chrome 114 or newer (the Side Panel API).
    Click it to open the translation side panel (click again to close it).
    Chrome narrows the page to make room, the same way it does for Gemini.
    The extension's toolbar popup has an "Open translation panel" button too.
-4. The panel header has a target-language dropdown, a scroll-sync button
+4. The panel header has a target-language dropdown with 35 choices, a scroll-sync button
    (two Joy-Con-style bars: snapped together = syncing, pulled apart = off)
    and a ⚙ settings gear (enabled toggle, translation backend, API key,
    re-translate). The same settings are in the toolbar popup.
+
+Translation starts enabled on each document load. Turning off **Enabled on this doc** pauses it for that page until you turn it back on or refresh.
 
 Nothing is fetched or translated while the panel is closed.
 
