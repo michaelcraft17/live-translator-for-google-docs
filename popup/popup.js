@@ -1,3 +1,4 @@
+(() => {
 const DEFAULT_SETTINGS = {
   backend: "google-cloud",
   apiKey: "",
@@ -37,6 +38,8 @@ function updateApiKeyVisibility() {
   apiKeyRow.hidden = backendSel.value === "google-free";
 }
 
+let panelTabId = null;
+
 async function init() {
   const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
   targetLangSel.value = settings.targetLang;
@@ -46,6 +49,7 @@ async function init() {
 
   const tab = await getActiveTab();
   if (isDocsTab(tab)) {
+    panelTabId = tab.id;
     const state = await sendToContent({ type: "GDT_GET_STATE" });
     if (state && state.ok) {
       enabledToggle.checked = state.enabled;
@@ -88,10 +92,13 @@ apiKeyInput.addEventListener("change", async () => {
 // (Absent when this script is loaded inside the side panel's settings view.)
 if (openPanelBtn) {
   openPanelBtn.addEventListener("click", () => {
-    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-      if (!isDocsTab(tab)) return;
-      chrome.sidePanel.open({ tabId: tab.id }).then(() => window.close());
-    });
+    if (panelTabId === null) return;
+    chrome.sidePanel.open({ tabId: panelTabId })
+      .then(() => window.close())
+      .catch((err) => {
+        openPanelBtn.textContent = "Retry opening panel";
+        openPanelBtn.title = err.message;
+      });
   });
 }
 
@@ -100,3 +107,5 @@ retranslateBtn.addEventListener("click", () => {
 });
 
 init();
+
+})();

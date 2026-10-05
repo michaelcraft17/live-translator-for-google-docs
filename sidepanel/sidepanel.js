@@ -77,6 +77,7 @@ function showScrollSync(on) {
 }
 
 function render(snapshot) {
+  document.getElementById("enabledToggle").checked = snapshot.enabled;
   if (typeof snapshot.scrollSync === "boolean") showScrollSync(snapshot.scrollSync);
   staleEl.hidden = !snapshot.stale;
   listEl.textContent = "";
@@ -136,6 +137,7 @@ function onMessage(msg) {
       staleEl.hidden = !msg.stale;
       break;
     case "enabled":
+      document.getElementById("enabledToggle").checked = msg.enabled;
       if (!msg.enabled) {
         listEl.textContent = "";
         setStatus("Translation is turned off.");
@@ -200,7 +202,7 @@ function connect() {
     }
     port = null;
   }
-  if (tabId === null) return;
+  if (tabId === null || document.hidden) return;
   const thisPort = chrome.tabs.connect(tabId, { name: "gdt-panel" });
   port = thisPort;
   thisPort.onMessage.addListener(onMessage);
@@ -229,3 +231,16 @@ async function init() {
 }
 
 init();
+
+// Chrome can retain a hidden panel page. A retained port must not make
+// the document button think the panel is still visible.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(reconnectTimer);
+    const previous = port;
+    port = null;
+    if (previous) previous.disconnect();
+  } else {
+    connect();
+  }
+});

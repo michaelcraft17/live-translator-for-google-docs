@@ -272,22 +272,43 @@
     return segmenter;
   }
 
+  // Titles always continue into the next word ("Dr. Smith"); the others
+  // ("etc.", "e.g.") only when the next segment doesn't start a new sentence.
+  const TITLE_ABBREV_RE = /(?:^|[\s("'“‘])(?:Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|Mt|Gen|Col|Capt|Lt|Sgt|Rev|Hon|Messrs|Mme|Mlle)\.$/;
+  const SOFT_ABBREV_RE = /(?:^|[\s("'“‘])(?:vs|etc|e\.g|i\.e|Inc|Ltd|Co|No|Fig|approx|cf|al)\.$/i;
+  const INITIAL_RE = /(?:^|[\s("'“‘])[A-Z]\.$/;
+
+  function endsInAbbreviation(prev, next) {
+    if (TITLE_ABBREV_RE.test(prev) || INITIAL_RE.test(prev)) return true;
+    return SOFT_ABBREV_RE.test(prev) && /^[a-z0-9]/.test(next);
+  }
+
+  // Intl.Segmenter breaks after "Dr." / "Ms." when a capital follows, so
+  // glue those fragments back onto the sentence they belong to.
+  function mergeAbbreviationBreaks(parts) {
+    const out = [];
+    for (const part of parts) {
+      if (out.length && endsInAbbreviation(out[out.length - 1].trim(), part.trim())) {
+        out[out.length - 1] += part; // raw join keeps the original whitespace
+      } else {
+        out.push(part);
+      }
+    }
+    return out;
+  }
+
   function segmentSentences(text) {
     const trimmed = text.trim();
     if (!trimmed) return [];
     const seg = getSegmenter();
+    let parts;
     if (seg) {
-      const out = [];
-      for (const { segment } of seg.segment(trimmed)) {
-        const s = segment.trim();
-        if (s) out.push(s);
-      }
-      return out;
+      parts = [];
+      for (const { segment } of seg.segment(trimmed)) parts.push(segment);
+    } else {
+      parts = trimmed.split(/(?<=[.!?]\s+)(?=[A-Z0-9"'])/);
     }
-    return trimmed
-      .split(/(?<=[.!?])\s+(?=[A-Z0-9"'])/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+    return mergeAbbreviationBreaks(parts.filter((x) => x.trim())).map((x) => x.trim());
   }
 
   // ---------- HTML export parsing ----------
@@ -319,8 +340,9 @@
   function extractBlockNodes(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
       acceptNode(node) {
-        if (node.tagName === "TR") return NodeFilter.FILTER_ACCEPT;
-        if (TEXT_BLOCK_TAGS.has(node.tagName) && !node.closest("table")) return NodeFilter.FILTER_ACCEPT;
+        // Paragraphs inside table cells are units of their own, so a click
+        // or highlight lands on one cell's sentence, not the whole row.
+        if (TEXT_BLOCK_TAGS.has(node.tagName)) return NodeFilter.FILTER_ACCEPT;
         return NodeFilter.FILTER_SKIP;
       },
     });
@@ -372,7 +394,7 @@
 
   function buildParagraphsFromBlocks(blockNodes) {
     return blockNodes.map((node, i) =>
-      makeParagraph(`p${i}`, node.tagName === "TR" ? "row" : "p", textOfBlock(node), "body", i)
+      makeParagraph(`p${i}`, "p", textOfBlock(node), "body", i)
     );
   }
 
@@ -926,6 +948,19 @@
   // "docs-" name whenever Docs has actually registered one sidesteps the
   // collision instead of relying on calibration to catch a gap that can
   // legitimately exceed what calibration is willing to trust.
+  // The `width` the exported (already px-scaled) stylesheet declares for a
+  // table cell's class(es), or 0 when it declares none.
+  function declaredCellWidthPx(cell, styleText) {
+    let width = 0;
+    for (const cn of (cell.getAttribute("class") || "").split(/\s+/).filter(Boolean)) {
+      const re = new RegExp("\\." + cn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\{([^}]*)\\}");
+      const m = styleText.match(re);
+      const w = m && m[1].match(/(?:^|;)\s*width:\s*([\d.]+)px/);
+      if (w) width = parseFloat(w[1]);
+    }
+    return width;
+  }
+
   function resolveMirrorFontFamily(fontFamily) {
     const bare = (fontFamily || "").replace(/^["']|["']$/g, "");
     if (!bare || bare.toLowerCase().startsWith("docs-")) return fontFamily;
@@ -1141,6 +1176,14 @@
     // heading, compounding down a document with many sections. With the
     // strut matched, the line box is exactly `lineHeightPx` everywhere.
     blockEl.style.fontSize = `${run.fontSizePx}px`;
+    // And the family: left as the block's own (the export's plain
+    // "Calibri", which isn't the registered "docs-Calibri" the runs use),
+    // the strut's font had different ascent/descent than the text, so
+    // every line box came out ~1px taller than the line-height — measured
+    // live as a 20.3px pitch against Docs' real 19.3px. That's a 1px drift
+    // per line down the whole mirror (~5px by the first table, ~18px by
+    // the table's sixth row).
+    if (run.fontFamily) blockEl.style.fontFamily = run.fontFamily;
 
     // Docs puts a line's extra leading entirely *below* the text: the
     // glyphs' ascent starts flush with the top of the line box (verified
@@ -1213,8 +1256,18 @@
   // getBoundingClientRect(), which (correctly) excludes margin — moving
   // the spacing there would make the paginator undercount every block's
   // real height and start splitting pages in the wrong place.
-  function collapseAdjacentBlockSpacing(blocks) {
+  function collapseAdjacentBlockSpacing(blocks, tables = []) {
     const list = Array.from(blocks);
+    // A table between two blocks is a real element in the flow: the space
+    // after the paragraph above it and before the one below it is kept in
+    // full, not collapsed as if the two paragraphs touched.
+    const tableBetween = (a, b) =>
+      tables.some(
+        (t) =>
+          a.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING &&
+          t.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING &&
+          !t.contains(b)
+      );
     const declared = list.map((el) => {
       const cs = getComputedStyle(el);
       return { top: parseFloat(cs.paddingTop) || 0, bottom: parseFloat(cs.paddingBottom) || 0 };
@@ -1222,6 +1275,7 @@
     const finalTop = declared.map((d) => d.top);
     const finalBottom = declared.map((d) => d.bottom);
     for (let i = 1; i < list.length; i++) {
+      if (tableBetween(list[i - 1], list[i])) continue;
       const betweenListItems = list[i - 1].tagName === "LI" && list[i].tagName === "LI";
       const collapsed = betweenListItems ? 0 : Math.max(finalBottom[i - 1], finalTop[i]);
       finalBottom[i - 1] = 0;
@@ -1404,10 +1458,10 @@
   // same page's clone of the list one level up, if any) whenever a leaf
   // lands on a page the cached clone isn't for yet.
   //
-  // `<table>` is deliberately NOT decomposed or split the same way as
-  // p/heading/li (still one atomic block): a straddling table would need
-  // per-row reflow to keep column widths consistent across the split,
-  // which is out of scope here.
+  // `<table>` is split between rows (never inside one) when it runs past a
+  // page, with its header row repeated on the continuation as Docs does —
+  // see placeLeaf. Fixed column widths (rebuildMirror) are what keep the
+  // two halves' columns aligned.
   //
   // Everything else that's splittable (any TEXT_BLOCK_TAGS tag — see
   // splitLeafAtHeight below) genuinely IS split into two DOM fragments at
@@ -1420,6 +1474,14 @@
   // measurably wrong but corrupted every leaf *after* it too (see
   // placeLeaf's own note on overflow carry-over) — splitting the leaf for
   // real, rather than approximating around it, removes both problems.
+  // Sub-pixel noise in the mirror's line heights (Docs lays lines out on
+  // whole pixels, the mirror on fractions) must not decide which page a
+  // block lands on: a list item that exactly filled the real page 1 came
+  // out 0.08px over budget here and was moved whole onto page 2, so its
+  // highlight vanished on page 1 and appeared in the wrong place on 2.
+  const FIT_SLOP_PX = 0.5;
+  const WRAP_SLACK_PX = 1;
+
   function paginateBlocks(scratch, pageContainers, printableHeightsPx, placementLog) {
     let pageIndex = 0;
     let usedHeight = 0;
@@ -1492,18 +1554,135 @@
 
       while (pageIndex < pageContainers.length - 1) {
         const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
-        if (usedHeight <= budget) break;
+        if (usedHeight <= budget + FIT_SLOP_PX) break;
         usedHeight -= budget;
         pageIndex += 1;
       }
     }
 
+    // Splits one table row at `limitY` (a viewport Y) the way Docs breaks a
+    // row across pages: every cell's single paragraph is cut at a line
+    // boundary (with the usual two-lines-a-side widow/orphan rule), what
+    // stays is the first part of the row and what's cut goes into a new
+    // continuation row of empty-shelled cells. Returns that row, or null —
+    // and then nothing has been changed — when the row can't be split
+    // (a cell with several paragraphs, or no cell has anything that would
+    // stay on this page).
+    function splitRowAtLimit(row, limitY) {
+      const cells = Array.from(row.cells);
+      const blocks = cells.map((c) => Array.from(c.querySelectorAll(BLOCK_LINE_SELECTOR)));
+      if (blocks.some((b) => b.length > 1)) return null;
+      // A cell is only changed when its own cut has something on both sides
+      // (which already makes the row splittable), so bailing out below with
+      // null never leaves a half-split row behind.
+      const results = [];
+      let anyStays = false;
+      let anyMoves = false;
+      for (let i = 0; i < cells.length; i++) {
+        const leaf = blocks[i][0];
+        if (!leaf) {
+          results.push(null);
+          continue;
+        }
+        const res = splitLeafAtHeight(leaf, limitY);
+        results.push(res);
+        if (!res) anyStays = true;
+        else {
+          if (res.firstPart) anyStays = true;
+          if (res.secondPart) anyMoves = true;
+        }
+      }
+      if (!anyStays || !anyMoves) return null;
+      const continuation = row.cloneNode(false);
+      cells.forEach((cell, i) => {
+        const newCell = cell.cloneNode(false);
+        const res = results[i];
+        if (res && res.secondPart) newCell.appendChild(res.secondPart);
+        continuation.appendChild(newCell);
+      });
+      return continuation;
+    }
+
+    // The block a heading is kept with: the next paragraph, or the first
+    // item of the list that follows it. Null when it's something Docs'
+    // keep-with-next treats differently (a table, nothing at all).
+    function firstLeafAfter(el) {
+      let next = el.nextElementSibling;
+      while (next && (next.tagName === "UL" || next.tagName === "OL")) next = next.firstElementChild;
+      return next && TEXT_BLOCK_TAGS.has(next.tagName) ? next : null;
+    }
+
     function placeLeaf(leafEl, listChain) {
+      // Docs keeps a heading with the start of whatever follows it: if the
+      // heading would fit at the bottom of a page but not its next two
+      // lines, the heading moves to the next page too. Without this the
+      // mirror left the heading stranded at the page's foot and put the
+      // list below it on the next page, so every highlight in that list
+      // sat a page away from where Docs draws it.
+      if (/^H[1-6]$/.test(leafEl.tagName) && usedHeight > 0 && pageIndex < pageContainers.length - 1) {
+        const next = firstLeafAfter(leafEl);
+        if (next) {
+          const pageBudget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
+          const ncs = getComputedStyle(next);
+          const line = parseFloat(ncs.lineHeight) || 0;
+          const need = Math.min(next.getBoundingClientRect().height, (parseFloat(ncs.paddingTop) || 0) + 2 * line);
+          if (leafEl.getBoundingClientRect().height + need > pageBudget - usedHeight + FIT_SLOP_PX) {
+            pageIndex += 1;
+            usedHeight = 0;
+          }
+        }
+      }
       const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
       const remaining = budget - usedHeight;
       const h = leafEl.getBoundingClientRect().height;
 
-      if (h > remaining && pageIndex < pageContainers.length - 1 && TEXT_BLOCK_TAGS.has(leafEl.tagName)) {
+      // A table that runs past the foot of the page breaks between rows,
+      // and Docs repeats the first (header) row at the top of the
+      // continuation. Left whole, the rows after the break were drawn
+      // ~200px (bottom margin + top margin + page gap) above where they
+      // really are, and the repeated header's own height was missing.
+      if (leafEl.tagName === "TABLE" && h > remaining + FIT_SLOP_PX && pageIndex < pageContainers.length - 1) {
+        const rows = Array.from(leafEl.rows);
+        const tableTop = leafEl.getBoundingClientRect().top;
+        let keep = 0;
+        for (const row of rows) {
+          if (row.getBoundingClientRect().bottom - tableTop <= remaining + FIT_SLOP_PX) keep += 1;
+          else break;
+        }
+        if (rows.length > 1 && keep < 2 && usedHeight > 0) {
+          // Not even the header and one row fit: the whole table starts on the next page.
+          pageIndex += 1;
+          usedHeight = 0;
+          placeLeaf(leafEl, listChain);
+          return;
+        }
+        if (keep >= 1 && keep < rows.length) {
+          const second = leafEl.cloneNode(false);
+          const body = document.createElement("tbody");
+          second.appendChild(body);
+          const header = rows[0].cloneNode(true);
+          // The repeated header is decoration: it must not look like a
+          // second copy of those paragraphs to the sentence mapping.
+          header.querySelectorAll("[data-gdt-para-index]").forEach((el) => el.removeAttribute("data-gdt-para-index"));
+          body.appendChild(header);
+          // Docs also breaks *inside* a row: each cell's text splits at a
+          // line boundary, the rest resuming in the same row on the next
+          // page. Try that for the first row that doesn't fit; when it
+          // can't be done the row moves over whole.
+          const continuation = keep >= 2 ? splitRowAtLimit(rows[keep], tableTop + remaining) : null;
+          if (continuation) body.appendChild(continuation);
+          rows.slice(continuation ? keep + 1 : keep).forEach((row) => body.appendChild(row));
+          leafEl.after(second); // stays measurable (attached) until it is placed
+          const entryPageIndex = pageIndex;
+          placeWhole(leafEl, listChain);
+          pageIndex = Math.max(pageIndex, entryPageIndex + 1);
+          usedHeight = 0;
+          placeLeaf(second, listChain); // may itself run past a page
+          return;
+        }
+      }
+
+      if (h > remaining + FIT_SLOP_PX && pageIndex < pageContainers.length - 1 && TEXT_BLOCK_TAGS.has(leafEl.tagName)) {
         const leafTop = leafEl.getBoundingClientRect().top;
         const split = remaining > 0 ? splitLeafAtHeight(leafEl, leafTop + remaining) : { firstPart: null, secondPart: leafEl };
         if (split) {
@@ -2019,12 +2198,25 @@
     }
     const pxPerPt = computePxPerPt(metricsPt, layout.width);
     let scaledStyle = rewriteFontFamiliesForMirror(scaleStyleTextPtToPx(state.lastStyleText, pxPerPt));
-    if (dp) {
+    // Docs draws a 1pt border as 1px (lines aren't scaled by 4/3 like text),
+    // so scaled-up table borders made every row ~0.3px taller than the real
+    // one and the error piled up row by row down a table.
+    scaledStyle = scaledStyle.replace(
+      /(border-(?:top|right|bottom|left)-width:\s*)([\d.]+)px/g,
+      (_m, prop, num) => `${prop}${(parseFloat(num) * 0.75).toFixed(3)}px`
+    );
+    {
       // Beats the export's own page-box rule, which carries stale margins.
+      // The text column is given a pixel of slack on the right (same total
+      // width): Docs lets a line that overshoots by a fraction of a pixel
+      // stay on the line, while the mirror wrapped it — a 624.125px line in
+      // a 624px column put one word on a second line, and its highlight
+      // spilled onto a line that isn't there.
       const sel = (state.lastBodyClassAttr || "").split(/\s+/).filter(Boolean).map((c) => `.${CSS.escape(c)}`).join("");
       if (sel) {
-        const px = (v) => `${(v * pxPerPt).toFixed(3)}px`;
-        scaledStyle += `\n${sel}{padding:${px(dp.top)} ${px(dp.right)} ${px(dp.bottom)} ${px(dp.left)} !important;max-width:${px(metricsPt.maxWidth)} !important}`;
+        const px = (v) => `${Math.max(0, v * pxPerPt).toFixed(3)}px`;
+        const slack = WRAP_SLACK_PX / pxPerPt;
+        scaledStyle += `\n${sel}{padding:${px(metricsPt.paddingTop)} ${px(metricsPt.paddingRight - slack)} ${px(metricsPt.paddingBottom)} ${px(metricsPt.paddingLeft)} !important;max-width:${px(metricsPt.maxWidth + slack)} !important}`;
       }
     }
     styleEl.textContent = scaledStyle;
@@ -2058,9 +2250,61 @@
     for (const child of Array.from(state.lastBodyNode.children)) {
       scratch.appendChild(document.importNode(child, true));
     }
+    // Docs sizes a column as its declared width *including* padding and
+    // borders; the export's class says `width:156pt` on a content-box cell
+    // and lets the browser's auto layout stretch the table to fill the
+    // line. Together that left the mirror's table ~7px wider than the real
+    // one, so each column's text sat a little further right than Docs'
+    // (the miss grew column by column). Pin the layout to the declared
+    // widths instead.
+    for (const table of scratch.querySelectorAll("table")) {
+      const firstRow = table.rows[0];
+      if (!firstRow) continue;
+      let total = 0;
+      let ok = true;
+      for (const cell of firstRow.cells) {
+        const w = declaredCellWidthPx(cell, scaledStyle);
+        if (!w) {
+          ok = false;
+          break;
+        }
+        total += w;
+      }
+      if (!ok) continue;
+      table.style.tableLayout = "fixed";
+      table.style.width = `${total.toFixed(3)}px`;
+      const cells = Array.from(table.querySelectorAll("td, th"));
+      cells.forEach((c) => {
+        c.style.boxSizing = "border-box";
+      });
+      // In a collapsed-border table half of each side's border is taken out
+      // of the cell's content box; Docs measures the text area from the
+      // padding alone. That ~0.75px is enough to wrap "…rough ER" onto a
+      // new line here when Docs keeps it on the first, which then puts the
+      // highlight on a line that isn't there. Give the half-border back.
+      cells.forEach((c) => {
+        const cs = getComputedStyle(c);
+        const give = (side, border) => {
+          const pad = parseFloat(cs[`padding${side}`]) || 0;
+          const half = (parseFloat(cs[`border${border}Width`]) || 0) / 2;
+          c.style[`padding${side}`] = `${Math.max(0, pad - half).toFixed(3)}px`;
+        };
+        give("Left", "Left");
+        give("Right", "Right");
+      });
+    }
     const flowBlocks = flowBlocksIn(scratch);
-    collapseAdjacentBlockSpacing(flowBlocks);
+    collapseAdjacentBlockSpacing(flowBlocks, Array.from(scratch.querySelectorAll("table")));
     flowBlocks.forEach(normalizeBlockEl);
+    // A table cell's paragraphs need the same line-height correction as
+    // flow blocks (Docs' 1.08 ratio applies to the font's natural height,
+    // not its size) — left raw, every cell line came out ~3.5px short, so
+    // the table ended up shorter than the real one and every highlight in
+    // and after it drifted. They stay out of flowBlocks because the
+    // spacing-collapse pass treats side-by-side cells as stacked.
+    Array.from(scratch.querySelectorAll(BLOCK_LINE_SELECTOR))
+      .filter((el) => el.closest("table"))
+      .forEach(normalizeBlockEl);
 
     // Tag each block with its logical paragraph index *before* pagination
     // gets a chance to split any of them (see paginateBlocks/
@@ -3047,13 +3291,37 @@
     btn.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="${TRANSLATE_ICON_PATH}"/></svg>`;
     // Opening a side panel has to happen in direct response to a click, so
     // hand the request to the background worker from inside the handler.
-    btn.addEventListener("click", () => {
-      if (state.sidePanelPort) {
-        chrome.runtime.sendMessage({ type: "GDT_CLOSE_PANEL" }).catch(() => {});
-        return;
+    let pending = false;
+    btn.addEventListener("click", async () => {
+      if (pending) return;
+      pending = true;
+      btn.setAttribute("aria-busy", "true");
+      const closing = !!state.sidePanelPort;
+      const deadline = setTimeout(() => {
+        pending = false;
+        btn.removeAttribute("aria-busy");
+      }, 4000);
+      try {
+        if (!closing && !state.enabled) setEnabled(true);
+        const result = await chrome.runtime.sendMessage({
+          type: closing ? "GDT_CLOSE_PANEL" : "GDT_OPEN_PANEL",
+        });
+        if (!result?.ok) throw new Error(result?.error || "Unable to toggle translation panel");
+        // Wait for the connection to reflect the requested state before
+        // accepting another toggle, including Chrome's opening animation.
+        const until = Date.now() + 2500;
+        while (!!state.sidePanelPort === closing && Date.now() < until) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        btn.title = "Translate";
+      } catch (err) {
+        console.warn("[GDT] Panel toggle failed", err);
+        btn.title = "Could not open or close the panel. Click to retry. " + err.message;
+      } finally {
+        clearTimeout(deadline);
+        pending = false;
+        btn.removeAttribute("aria-busy");
       }
-      if (!state.enabled) setEnabled(true);
-      chrome.runtime.sendMessage({ type: "GDT_OPEN_PANEL" }).catch(() => {});
     });
     state.floatingBtn = btn;
     placeFloatingButton();
@@ -3157,7 +3425,7 @@
       renderPanelFull(); // the panel emptied itself when told translation was off
       void refreshFromDoc();
     }
-    chrome.storage.local.set({ gdt_enabled: enabled });
+    // This switch applies to this loaded document; new pages start enabled.
   }
 
   function setScrollSync(scrollSync) {
@@ -3192,13 +3460,15 @@
 
     const stored = await chrome.storage.sync.get({ targetLang: "zh-CN" });
     state.targetLang = stored.targetLang;
-    const localStored = await chrome.storage.local.get({ gdt_enabled: true, gdt_scroll_sync: true });
-    state.enabled = localStored.gdt_enabled;
+    const localStored = await chrome.storage.local.get({ gdt_scroll_sync: true });
+    state.enabled = true;
     state.scrollSync = localStored.gdt_scroll_sync;
 
     const editorRoot = await waitForEditor();
     log("editor root found:", editorRoot.className || editorRoot.id);
 
+    chrome.runtime.onConnect.addListener(onPanelConnect);
+    await chrome.runtime.sendMessage({ type: "GDT_PREPARE_PANEL" });
     createFloatingButton();
     setEnabled(state.enabled);
 
@@ -3212,7 +3482,6 @@
     }
 
     document.addEventListener("click", onOriginalClick, true);
-    chrome.runtime.onConnect.addListener(onPanelConnect);
 
     setInterval(refreshFromDoc, REFRESH_POLL_MS);
     // Switching document tabs only changes the URL (no page load), so watch

@@ -68,7 +68,7 @@ async function translateOne(text, targetLang, settings) {
       body: new URLSearchParams({
         auth_key: settings.apiKey,
         text,
-        target_lang: targetLang.toUpperCase(),
+        target_lang: ({ "zh-CN": "ZH-HANS", "zh-TW": "ZH-HANT", no: "NB" }[targetLang] || targetLang.toUpperCase()),
       }),
     });
     if (!res.ok) throw new Error(`deepl HTTP ${res.status}`);
@@ -150,25 +150,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 const DOCS_URL_RE = /^https:\/\/docs\.google\.com\/document\//;
 
-async function syncSidePanelForTab(tabId, url) {
-  try {
-    await chrome.sidePanel.setOptions({
-      tabId,
-      path: "sidepanel/sidepanel.html",
-      enabled: DOCS_URL_RE.test(url || ""),
-    });
-  } catch (err) {
-    // tab closed while we were looking at it
-  }
+function syncSidePanelForTab(tabId, url) {
+  return chrome.sidePanel.setOptions({
+    tabId,
+    path: "sidepanel/sidepanel.html",
+    enabled: DOCS_URL_RE.test(url || ""),
+  });
 }
 
-chrome.sidePanel.setOptions({ enabled: false }).catch(() => {});
-chrome.tabs.query({}).then((tabs) => tabs.forEach((t) => syncSidePanelForTab(t.id, t.url)));
+// Configure defaults on installation, not every service-worker wakeup.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.sidePanel.setOptions({ enabled: false }).catch(console.warn);
+  chrome.tabs.query({}).then((tabs) => {
+    tabs.forEach((t) => syncSidePanelForTab(t.id, t.url).catch(console.warn));
+  });
+});
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.url || info.status === "complete") syncSidePanelForTab(tabId, tab.url);
+  if (info.url || info.status === "complete") syncSidePanelForTab(tabId, tab.url).catch(console.warn);
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "GDT_PREPARE_PANEL" && sender.tab) {
+    syncSidePanelForTab(sender.tab.id, sender.tab.url)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
   if (msg && msg.type === "GDT_CLOSE_PANEL" && sender.tab) {
     const tabId = sender.tab.id;
     (async () => {
