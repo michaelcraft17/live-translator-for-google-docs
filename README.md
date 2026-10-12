@@ -66,6 +66,45 @@ and only re-lays out for a genuine window resize.
   docx values override the mirror's page box. A layout change (not just a
   text change) also rebuilds the mirror. If the tab-specific docx request is
   refused, the plain one is used.
+- **Explicit page breaks** (Ctrl+Enter) export as a zero-height
+  `<hr style="page-break-before:always;display:none">`; the paginator
+  starts a new page at each one.
+- **Multi-column sections** are not in the HTML export at all. The `.docx`
+  export (already fetched for headers and margins) carries `w:cols` per
+  section, so `parseDocxColumns` reads it, `applyColumnSections` matches
+  docx paragraphs to HTML blocks by text and wraps each multi-column
+  section's blocks in a balanced CSS multi-column box. If fewer than 80% of
+  the blocks match, columns are skipped. A column section that runs across
+  a page break is not split; it stays one box.
+- **Default text style** comes from the docx's `word/styles.xml` (default
+  paragraph style, else `docDefaults`). The export omits font-size and
+  font-family on runs that match it, which left them at the browser's 16px
+  serif; a doc whose default is 11pt Arial had those lines ~10% too wide,
+  wrapping an extra line and pushing everything after it down the page.
+- **Trailing space-after** on the last block of a page is not counted when
+  deciding whether the block fits (Docs drops it at a page foot).
+- **Dropdown chips** export as bare link-styled runs (`#0000ee`, underlined,
+  no `<a>`). They get the pill's padding (5px / 16px / 4px) and a 22.5px
+  inline-block line height, because a chip line is taller than a text line
+  in Docs; without it the mirror lost ~2px per chip line.
+- **Soft line breaks at the end of a paragraph** (`<br>` last in its block)
+  get a second `<br>`: Docs draws a blank line for them, a browser doesn't.
+  An answer box ending in one was 17px short in the mirror.
+- **Tables get a 1px gap below them.** Measured against the real page, the
+  line after each answer box sits ~1px lower than the collapsed-border box
+  implies; over a page of 5–6 boxes that is enough to put the lines at the
+  foot on the wrong side of a page break.
+- **The blank paragraph after an explicit page break** is one single-spaced
+  line at the default size (17.6px), not a line in the paragraph's own
+  (heading-sized) font. The export splits the paragraph holding the break in
+  two, and the second half is only its end mark; at 25.8px it left the whole
+  next page 8px low.
+- **Blank paragraphs at a page's foot stay there** when the font's natural
+  line height (17.6px for 11pt Lato, rounded up to 18) fits, even though the
+  1.15-spaced line is 20.2px: Docs lets the leading spill into the margin.
+  Blanks with 18.9px of room stayed; ones with 17.7, 16.6 and 8px moved on.
+- **One-row answer boxes** that don't fit the rest of a page start the next
+  page whole when they're under four lines tall (Docs won't split them).
 - **Page breaks follow Docs' widow/orphan control**: at least two lines of
   a paragraph on each side of a break, otherwise the lines (or a short
   paragraph, whole) move to the next page.

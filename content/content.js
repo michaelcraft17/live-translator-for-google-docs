@@ -136,6 +136,10 @@
     lastTabId: null,
     // Page margins/width in pt from the docx export (see fetchHeaderFooterTexts).
     docxPage: null,
+    // Multi-column sections from the docx export (see parseDocxColumns).
+    docxColumns: null,
+    // Default font size (pt) and family from the docx's styles.xml (see parseDocxDefaults).
+    docxDefaults: null,
     // Extra distance the real body starts below the page's top margin,
     // which only a page header causes and only measurement can reveal
     // (see calibrateAgainstRealPage). Index 0 is page 1 — the page a
@@ -288,7 +292,9 @@
   function mergeAbbreviationBreaks(parts) {
     const out = [];
     for (const part of parts) {
-      if (out.length && endsInAbbreviation(out[out.length - 1].trim(), part.trim())) {
+      // "Govt./Politics", "and/or": a slash straight after the period is
+      // the same word, not a new sentence.
+      if (out.length && (/^\//.test(part) || endsInAbbreviation(out[out.length - 1].trim(), part.trim()))) {
         out[out.length - 1] += part; // raw join keeps the original whitespace
       } else {
         out.push(part);
@@ -313,11 +319,27 @@
 
   // ---------- HTML export parsing ----------
 
+  // The export emits Title/Subtitle's named-style defaults as `.title{...;
+  // text-align:left}` *after* the per-paragraph classes, at the same
+  // specificity — so for `class="c38 title"` with `.c38{text-align:center}`
+  // the default beats the paragraph's own alignment and a centered title
+  // lays out flush left in the mirror. In Docs, direct paragraph formatting
+  // wins, so move the named-style rules ahead of everything else and let the
+  // `cN` classes override them.
+  function hoistNamedStyleRules(styleText) {
+    const named = [];
+    const rest = styleText.replace(/\.(?:title|subtitle)\s*\{[^}]*\}/g, (m) => {
+      named.push(m);
+      return "";
+    });
+    return named.join("") + rest;
+  }
+
   function parseExportedDocument(html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     const styleEl = doc.querySelector("style");
     return {
-      styleText: styleEl ? styleEl.textContent : "",
+      styleText: styleEl ? hoistNamedStyleRules(styleEl.textContent) : "",
       bodyNode: doc.body,
     };
   }
@@ -506,6 +528,72 @@
       .filter(Boolean);
   }
 
+  // The export leaves font-size and font-family off any run that matches
+  // the document's default text style, so what they inherit has to come from
+  // the docx (word/styles.xml: the default paragraph style, else
+  // docDefaults). Left to the browser they became 16px serif: a run that
+  // Docs draws at 11pt came out ~10% wider, wrapped onto a second line and
+  // pushed everything after it down the page.
+  function parseDocxDefaults(xml) {
+    const pick = (block) => {
+      const sz = block && block.match(/<w:sz\s+w:val="(\d+)"/);
+      const fam = block && block.match(/<w:rFonts\b[^>]*w:ascii="([^"]+)"/);
+      return { pt: sz ? parseInt(sz[1], 10) / 2 : null, family: fam ? fam[1] : null };
+    };
+    const dd = pick((xml.match(/<w:docDefaults>[\s\S]*?<\/w:docDefaults>/) || [])[0]);
+    let normal = { pt: null, family: null };
+    for (const m of xml.matchAll(/<w:style\b([^>]*)>([\s\S]*?)<\/w:style>/g)) {
+      if (/w:type="paragraph"/.test(m[1]) && /w:default="1"/.test(m[1])) {
+        normal = pick(m[2]);
+        break;
+      }
+    }
+    const pt = normal.pt || dd.pt;
+    return pt ? { pt, family: normal.family || dd.family } : null;
+  }
+
+  // Column layout per section, from word/document.xml. The HTML export has
+  // no trace of columns, so a two-column list came out as one tall column
+  // and pushed everything after it down the page (and every later page out
+  // of step). `texts` is each docx paragraph's text with whitespace removed,
+  // used to find the matching HTML block; `sections` lists only the
+  // multi-column ones as inclusive docx paragraph ranges. A section's
+  // properties sit on its *last* paragraph (the body's own `sectPr` closes
+  // the final one).
+  function parseDocxColumns(xml) {
+    const doc = new DOMParser().parseFromString(xml, "application/xml");
+    if (doc.querySelector("parsererror")) return null;
+    const body = doc.getElementsByTagName("w:body")[0];
+    if (!body) return null;
+    const paras = Array.from(doc.getElementsByTagName("w:p"));
+    const texts = paras.map((p) =>
+      Array.from(p.getElementsByTagName("w:t"))
+        .map((t) => t.textContent)
+        .join("")
+        .replace(/\s+/g, "")
+    );
+    const childNamed = (el, name) => Array.from(el.children).find((c) => c.tagName === name);
+    const colsOf = (sectPr) => {
+      const c = sectPr.getElementsByTagName("w:cols")[0];
+      const num = c ? parseInt(c.getAttribute("w:num") || "1", 10) : 1;
+      const space = c ? parseInt(c.getAttribute("w:space") || "720", 10) : 720;
+      return { num: num || 1, spacePt: space / 20 };
+    };
+    const sections = [];
+    let start = 0;
+    paras.forEach((p, i) => {
+      const pPr = childNamed(p, "w:pPr");
+      const sectPr = pPr && childNamed(pPr, "w:sectPr");
+      if (sectPr) {
+        sections.push({ start, end: i, ...colsOf(sectPr) });
+        start = i + 1;
+      }
+    });
+    const last = childNamed(body, "w:sectPr");
+    if (last && start < paras.length) sections.push({ start, end: paras.length - 1, ...colsOf(last) });
+    return { texts, sections: sections.filter((sec) => sec.num > 1 && sec.end >= sec.start) };
+  }
+
   async function fetchHeaderFooterTexts(docId) {
     const now = Date.now();
     if (now < exportFetchBackoffUntil) return null; // already rate-limited; don't make it worse
@@ -552,9 +640,17 @@
     // of truth for them. A document with several sections has several
     // `pgMar`s; the last is the body-level one.
     let page = null;
+    let columns = null;
+    let defaults = null;
+    const stylesEntry = zip.entries.find((e) => e.name === "word/styles.xml");
+    if (stylesEntry) {
+      const stylesXml = await readZipEntryText(bytes, zip.view, stylesEntry);
+      defaults = stylesXml ? parseDocxDefaults(stylesXml) : null;
+    }
     const docEntry = zip.entries.find((e) => e.name === "word/document.xml");
     if (docEntry) {
       const xml = await readZipEntryText(bytes, zip.view, docEntry);
+      columns = xml ? parseDocxColumns(xml) : null;
       const mar = xml && Array.from(xml.matchAll(/<w:pgMar\b[^>]*>/g)).pop();
       const sz = xml && Array.from(xml.matchAll(/<w:pgSz\b[^>]*>/g)).pop();
       const twips = (tag, attr) => {
@@ -575,6 +671,8 @@
       header: await collect(/^word\/header\d*\.xml$/),
       footer: await collect(/^word\/footer\d*\.xml$/),
       page,
+      columns,
+      defaults,
     };
   }
 
@@ -989,7 +1087,10 @@
     for (const face of document.fonts) {
       registered.add(face.family.replace(/^["']|["']$/g, ""));
     }
-    return styleText.replace(/font-family:\s*([^;]+);/g, (m, list) => {
+    // The terminator is optional: a rule's last declaration has no `;`
+    // (`.c4{font-weight:400;font-family:"Lato"}`), and skipping those left
+    // the mirror on the system font with different glyph widths.
+    return styleText.replace(/font-family:\s*([^;}]+)/g, (m, list) => {
       const rewritten = list
         .split(",")
         .map((name) => {
@@ -1000,7 +1101,7 @@
           return registered.has(prefixed) ? `"${prefixed}"` : trimmed;
         })
         .join(", ");
-      return `font-family: ${rewritten};`;
+      return `font-family: ${rewritten}`;
     });
   }
 
@@ -1175,6 +1276,18 @@
     // everything below it, and it measured as a step of ~0.75px at every
     // heading, compounding down a document with many sections. With the
     // strut matched, the line box is exactly `lineHeightPx` everywhere.
+    // Runs the export left unsized (it omits whatever matches the document
+    // default) inherit their size and family from this block. Overriding
+    // the block just below would silently change every one of them to the
+    // dominant run's: an 11pt sentence ending in a 12pt full stop became
+    // all-12pt, wrapped a line early, and pushed the rest of the page down.
+    // So pin whatever is currently inherited before touching the block.
+    const origFamily = cs.fontFamily;
+    for (const el of blockEl.querySelectorAll("*")) {
+      const ecs = getComputedStyle(el);
+      if (Math.abs(parseFloat(ecs.fontSize) - blockFontSizePx) < 0.01) el.style.fontSize = `${blockFontSizePx}px`;
+      if (ecs.fontFamily === origFamily) el.style.fontFamily = origFamily;
+    }
     blockEl.style.fontSize = `${run.fontSizePx}px`;
     // And the family: left as the block's own (the export's plain
     // "Calibri", which isn't the registered "docs-Calibri" the runs use),
@@ -1213,8 +1326,24 @@
     // declared height can't simply be dropped either — an empty block has
     // no line boxes, so CSS would collapse it to nothing — so it's
     // replaced with the line height computed just above.
+    // One that holds soft line breaks (see padTrailingLineBreaks) is one
+    // line per break, not one line.
     if (!(blockEl.textContent || "").trim()) {
-      blockEl.style.height = `${lineHeightPx.toFixed(3)}px`;
+      const lines = Math.max(1, blockEl.querySelectorAll("br").length);
+      let px = lineHeightPx * lines;
+      // The export cuts the paragraph holding a page break in two
+      // (`<p/><hr page-break/><p/>`). The half after the break is just that
+      // paragraph's end mark, and Docs gives it one single-spaced line at
+      // the document's default size: 17.6px against the 25.8px the
+      // paragraph's own (heading-sized) font gave, which put the whole next
+      // page 8px low and its first line 17px low.
+      const prev = blockEl.previousElementSibling;
+      if (lines === 1 && prev && prev.tagName === "HR" && /page-break-before\s*:\s*always/i.test(prev.getAttribute("style") || "")) {
+        const baseSize = parseFloat(getComputedStyle(blockEl.parentElement || document.body).fontSize);
+        const baseNatural = baseSize && measureNaturalLineHeightPx(run.fontFamily, baseSize, "400", "normal");
+        if (baseNatural) px = baseNatural;
+      }
+      blockEl.style.height = `${px.toFixed(3)}px`;
     }
   }
 
@@ -1481,6 +1610,7 @@
   // highlight vanished on page 1 and appeared in the wrong place on 2.
   const FIT_SLOP_PX = 0.5;
   const WRAP_SLACK_PX = 1;
+  const TABLE_TRAILING_GAP_PX = 1;
 
   function paginateBlocks(scratch, pageContainers, printableHeightsPx, placementLog) {
     let pageIndex = 0;
@@ -1496,6 +1626,16 @@
       return clone;
     }
 
+    // The block's own space-after (padding-bottom; see
+    // collapseAdjacentBlockSpacing). Docs doesn't need it to fit on the
+    // page: the last paragraph of a page keeps all its lines there even
+    // when its trailing space would not have fitted. Counting it moved the
+    // last bullet of a page (a 3-line item that fit by under a pixel) onto
+    // the next one, and every highlight after it was a page out.
+    function trailingSpace(el) {
+      return parseFloat(getComputedStyle(el).paddingBottom) || 0;
+    }
+
     // Places a leaf on the CURRENT page unconditionally, then, if its
     // height pushes the running total past the page's budget, treats the
     // excess as spilling onto the next page(s) and carries it forward as
@@ -1508,6 +1648,22 @@
     // even now that splitting exists: it's what keeps a *table*'s own
     // overflow from corrupting whatever comes after it, the same way it
     // used to matter for every splittable leaf before splitting existed.
+    // Docs keeps an empty paragraph at the foot of a page when its line
+    // starts there and the line's own box fits: the extra leading from a
+    // 1.15 line spacing may spill into the bottom margin, so what has to
+    // fit is the font's natural line height (17.6px for 11pt Lato) rounded
+    // up to whole pixels, not the 20.2px the spaced line takes. Measured on
+    // a real document: blanks with 18.9px of room stayed, ones with 17.7,
+    // 16.6 and 8px moved to the next page.
+    function blankStaysAtFoot(el, topY, budget) {
+      if (!TEXT_BLOCK_TAGS.has(el.tagName)) return false;
+      if ((el.textContent || "").trim() || el.querySelector("img")) return false;
+      if (el.querySelectorAll("br").length > 1) return false;
+      const natural = parseFloat(el.dataset.gdtNatural) * parseFloat(getComputedStyle(el).fontSize);
+      if (!(natural > 0)) return false;
+      return topY > 0 && budget - topY >= Math.ceil(natural - 0.05);
+    }
+
     function placeWhole(leafEl, listChain) {
       // "Space before paragraph" is suppressed at the top of a page —
       // whatever gap it would have opened has already been absorbed by
@@ -1538,7 +1694,7 @@
       // page containers are all the same width, so moving it doesn't
       // reflow it.
       const h = leafEl.getBoundingClientRect().height;
-      usedHeight += h;
+      usedHeight += h + (leafEl.tagName === "TABLE" ? parseFloat(getComputedStyle(leafEl).marginBottom) || 0 : 0);
       // TEMP DIAGNOSTIC (see debugging session) — see rebuildMirror's
       // gdtMirrorStats note. Safe to delete once the drift is found.
       if (placementLog) {
@@ -1555,6 +1711,20 @@
       while (pageIndex < pageContainers.length - 1) {
         const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
         if (usedHeight <= budget + FIT_SLOP_PX) break;
+        // Space-after on the last block of a page is dropped, not carried:
+        // a block whose only overshoot is its own trailing space still
+        // belongs on this page, and the page is simply full.
+        if (TEXT_BLOCK_TAGS.has(leafEl.tagName) && usedHeight - budget <= trailingSpace(leafEl) + FIT_SLOP_PX) {
+          usedHeight = budget;
+          break;
+        }
+        // A blank paragraph that starts on this page stays on it however
+        // little room is left, and its overshoot is dropped, not carried
+        // (see blankStaysAtFoot).
+        if (blankStaysAtFoot(leafEl, usedHeight - h, budget)) {
+          usedHeight = budget;
+          break;
+        }
         usedHeight -= budget;
         pageIndex += 1;
       }
@@ -1636,6 +1806,28 @@
       const remaining = budget - usedHeight;
       const h = leafEl.getBoundingClientRect().height;
 
+      // A one-row table (an answer box) that doesn't fit what is left of the
+      // page. Docs won't cut a row of under four lines (two-a-side
+      // widow/orphan rule), so the whole box starts the next page; left in
+      // place it spilled over the foot of this one and every box after it
+      // was drawn a page above its text.
+      if (
+        leafEl.tagName === "TABLE" &&
+        leafEl.rows.length === 1 &&
+        usedHeight > 0 &&
+        h > remaining + FIT_SLOP_PX &&
+        pageIndex < pageContainers.length - 1
+      ) {
+        const leaf = leafEl.rows[0].querySelector(BLOCK_LINE_SELECTOR);
+        const line = leaf ? parseFloat(getComputedStyle(leaf).lineHeight) || 0 : 0;
+        if (line > 0 && leafEl.rows[0].getBoundingClientRect().height < 4.5 * line) {
+          pageIndex += 1;
+          usedHeight = 0;
+          placeLeaf(leafEl, listChain);
+          return;
+        }
+      }
+
       // A table that runs past the foot of the page breaks between rows,
       // and Docs repeats the first (header) row at the top of the
       // continuation. Left whole, the rows after the break were drawn
@@ -1682,7 +1874,13 @@
         }
       }
 
-      if (h > remaining + FIT_SLOP_PX && pageIndex < pageContainers.length - 1 && TEXT_BLOCK_TAGS.has(leafEl.tagName)) {
+      const fitH = TEXT_BLOCK_TAGS.has(leafEl.tagName) ? h - trailingSpace(leafEl) : h;
+      if (
+        fitH > remaining + FIT_SLOP_PX &&
+        pageIndex < pageContainers.length - 1 &&
+        TEXT_BLOCK_TAGS.has(leafEl.tagName) &&
+        !blankStaysAtFoot(leafEl, usedHeight, usedHeight + remaining)
+      ) {
         const leafTop = leafEl.getBoundingClientRect().top;
         const split = remaining > 0 ? splitLeafAtHeight(leafEl, leafTop + remaining) : { firstPart: null, secondPart: leafEl };
         if (split) {
@@ -1733,8 +1931,21 @@
       placeWhole(leafEl, listChain);
     }
 
+    // An explicit page break (Ctrl+Enter) exports as a zero-height
+    // `<hr style="page-break-before:always;display:none">` ahead of the
+    // paragraph that starts the new page. Without this the paginator never
+    // saw it, so every page after the first break held the wrong blocks.
+    function isExplicitPageBreak(el) {
+      return el.tagName === "HR" && /page-break-before\s*:\s*always/i.test(el.getAttribute("style") || "");
+    }
+
     function walk(node, listChain) {
       for (const child of Array.from(node.children)) {
+        if (isExplicitPageBreak(child)) {
+          if (pageIndex < pageContainers.length - 1) pageIndex += 1;
+          usedHeight = 0;
+          continue;
+        }
         if (child.tagName === "UL" || child.tagName === "OL") {
           walk(child, [...listChain, child]);
         } else {
@@ -2174,6 +2385,75 @@
   let calibrationPass = 0;
   let rebuildingFromCalibration = false;
 
+  // Lays each multi-column section (see parseDocxColumns) out in balanced
+  // columns by wrapping its blocks in a CSS multi-column box, the way Docs
+  // balances a continuous section. Blocks are matched to docx paragraphs by
+  // text, in order; if too few match the mapping isn't trusted and the
+  // sections stay single-column (the old behaviour) rather than risk
+  // wrapping the wrong blocks.
+  // A soft line break (Shift+Enter) at the end of a paragraph exports as a
+  // trailing <br>. Docs gives it its own blank line, but a browser collapses
+  // a block-final <br> to nothing, so a paragraph holding only one came out a
+  // line short (17px in an answer box) and everything after it drifted up.
+  // A second <br> makes the browser draw the line Docs draws.
+  function padTrailingLineBreaks(scratch) {
+    for (const br of Array.from(scratch.querySelectorAll("br"))) {
+      const block = br.closest(BLOCK_LINE_SELECTOR);
+      if (!block) continue;
+      const after = document.createRange();
+      after.setStartAfter(br);
+      after.setEnd(block, block.childNodes.length);
+      const rest = after.cloneContents();
+      if (after.toString().trim() || rest.querySelector("br, img")) continue;
+      br.after(document.createElement("br"));
+    }
+  }
+
+  function applyColumnSections(scratch, pxPerPt) {
+    const cols = state.docxColumns;
+    if (!cols || !cols.sections.length) return;
+    const nodes = extractBlockNodes(scratch);
+    const map = new Array(nodes.length).fill(-1);
+    let d = 0;
+    let matched = 0;
+    nodes.forEach((node, h) => {
+      const t = textOfBlock(node).replace(/\s+/g, "");
+      for (let k = d; k < Math.min(cols.texts.length, d + 4); k++) {
+        if (cols.texts[k] === t) {
+          map[h] = k;
+          d = k + 1;
+          matched += 1;
+          break;
+        }
+      }
+    });
+    if (!nodes.length || matched < nodes.length * 0.8) return;
+
+    for (const sec of cols.sections) {
+      let hStart = -1;
+      let hEnd = -1;
+      map.forEach((k, h) => {
+        if (k >= sec.start && k <= sec.end) {
+          if (hStart < 0) hStart = h;
+          hEnd = h;
+        }
+      });
+      if (hStart < 0) continue;
+      const members = Array.from(scratch.children).filter((child) => {
+        const idxs = [child, ...child.querySelectorAll("[data-gdt-para-index]")]
+          .filter((el) => el.dataset && el.dataset.gdtParaIndex !== undefined)
+          .map((el) => Number(el.dataset.gdtParaIndex));
+        return idxs.length && Math.min(...idxs) >= hStart && Math.max(...idxs) <= hEnd;
+      });
+      if (!members.length) continue;
+      const wrap = document.createElement("div");
+      wrap.dataset.gdtColumns = String(sec.num);
+      wrap.style.cssText = `column-count:${sec.num};column-gap:${(sec.spacePt * pxPerPt).toFixed(3)}px;column-fill:balance;`;
+      members[0].before(wrap);
+      members.forEach((m) => wrap.appendChild(m));
+    }
+  }
+
   function rebuildMirror() {
     if (!state.lastBodyNode) return;
     const layout = getPageLayout();
@@ -2197,7 +2477,13 @@
       metricsPt.maxWidth = dp.width - dp.left - dp.right;
     }
     const pxPerPt = computePxPerPt(metricsPt, layout.width);
-    let scaledStyle = rewriteFontFamiliesForMirror(scaleStyleTextPtToPx(state.lastStyleText, pxPerPt));
+    // Lowest-priority base for text the export leaves unstyled (see
+    // parseDocxDefaults); every exported rule below it wins.
+    const dflt = state.docxDefaults;
+    const defaultStyle = dflt
+      ? `.doc-content{font-size:${dflt.pt}pt;${dflt.family ? `font-family:"${dflt.family}";` : ""}}\n`
+      : "";
+    let scaledStyle = rewriteFontFamiliesForMirror(scaleStyleTextPtToPx(defaultStyle + state.lastStyleText, pxPerPt));
     // Docs draws a 1pt border as 1px (lines aren't scaled by 4/3 like text),
     // so scaled-up table borders made every row ~0.3px taller than the real
     // one and the error piled up row by row down a table.
@@ -2217,6 +2503,30 @@
         const px = (v) => `${Math.max(0, v * pxPerPt).toFixed(3)}px`;
         const slack = WRAP_SLACK_PX / pxPerPt;
         scaledStyle += `\n${sel}{padding:${px(metricsPt.paddingTop)} ${px(metricsPt.paddingRight - slack)} ${px(metricsPt.paddingBottom)} ${px(metricsPt.paddingLeft)} !important;max-width:${px(metricsPt.maxWidth + slack)} !important}`;
+      }
+    }
+    {
+      // A dropdown chip exports as a bare run styled like a default link
+      // (blue, underlined) but not inside an <a>, with nothing to say it was
+      // a chip. Docs draws it as a pill: ~5px before the text, ~16px for the
+      // arrow after it and a 4px gap to the next chip, none of which the
+      // mirror's tight text had, so each chip pulled the rest of the line
+      // ~25px left of where Docs put it.
+      const chipClasses = [];
+      state.lastStyleText.replace(/\.([\w-]+)\{([^}]*)\}/g, (m, cls, decl) => {
+        if (/color:\s*#0000ee/i.test(decl) && /text-decoration:\s*underline/i.test(decl)) chipClasses.push(cls);
+        return m;
+      });
+      if (chipClasses.length) {
+        const z = pxPerPt * 0.75; // 1 at 100% zoom
+        const sel = chipClasses.map((c) => `.${CSS.escape(c)}`);
+        // The pill is also taller than the text, so a line holding one is
+        // ~22.5px tall against 20.2px for plain 11pt text (measured on a
+        // real doc: chip lines at a 22.5px pitch). An inline-block with
+        // that line height stretches the line box the same way; without it
+        // every chip line lost ~2px and a page of them drifted 25px.
+        scaledStyle += `\n${sel.join(",")}{display:inline-block;line-height:${(22.5 * z).toFixed(2)}px;padding:0 ${(16 * z).toFixed(2)}px 0 ${(5 * z).toFixed(2)}px;margin-right:${(4 * z).toFixed(2)}px}`;
+        scaledStyle += `\n${sel.map((x) => `a ${x}`).join(",")}{display:inline;line-height:inherit;padding:0;margin:0}`;
       }
     }
     styleEl.textContent = scaledStyle;
@@ -2272,6 +2582,11 @@
       }
       if (!ok) continue;
       table.style.tableLayout = "fixed";
+      // Docs leaves ~1px more below a table than the collapsed-border box
+      // measures: against the real page every answer box was followed by
+      // lines ~1px lower than the mirror put them, and over a page of boxes
+      // (5-6) that put the lines at the foot on the wrong side of the break.
+      table.style.marginBottom = `${TABLE_TRAILING_GAP_PX}px`;
       table.style.width = `${total.toFixed(3)}px`;
       const cells = Array.from(table.querySelectorAll("td, th"));
       cells.forEach((c) => {
@@ -2293,6 +2608,7 @@
         give("Right", "Right");
       });
     }
+    padTrailingLineBreaks(scratch);
     const flowBlocks = flowBlocksIn(scratch);
     collapseAdjacentBlockSpacing(flowBlocks, Array.from(scratch.querySelectorAll("table")));
     flowBlocks.forEach(normalizeBlockEl);
@@ -2315,6 +2631,8 @@
     extractBlockNodes(scratch).forEach((node, i) => {
       node.dataset.gdtParaIndex = String(i);
     });
+
+    applyColumnSections(scratch, pxPerPt);
 
     const placementLog = [];
     paginateBlocks(scratch, containers, printableHeightsPx, placementLog);
@@ -3141,6 +3459,8 @@
     state.headerFooter = null;
     state.headerFooterSignature = null;
     state.docxPage = null;
+    state.docxColumns = null;
+    state.docxDefaults = null;
     lastHeaderFetchAt = 0; // margins can differ per tab; fetch them for this one
     // Throttle/backoff are left alone on purpose: a switch must not be a
     // way around an active rate limit.
@@ -3164,10 +3484,16 @@
     if (!texts) return; // throttled or backing off; nothing to do
     const signature = JSON.stringify(texts);
     if (signature === state.headerFooterSignature) return;
-    const pageChanged = JSON.stringify(texts.page) !== JSON.stringify(state.docxPage);
+    const columnsOf = (c) => JSON.stringify((c && c.sections) || []);
+    const pageChanged =
+      JSON.stringify(texts.page) !== JSON.stringify(state.docxPage) ||
+      columnsOf(texts.columns) !== columnsOf(state.docxColumns) ||
+      JSON.stringify(texts.defaults) !== JSON.stringify(state.docxDefaults);
     state.headerFooter = texts;
     state.headerFooterSignature = signature;
     state.docxPage = texts.page;
+    state.docxColumns = texts.columns;
+    state.docxDefaults = texts.defaults;
     if (pageChanged && state.lastBodyNode) {
       clearOriginalHighlight();
       rebuildMirror();
