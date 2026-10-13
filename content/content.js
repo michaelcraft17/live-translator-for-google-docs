@@ -1520,6 +1520,39 @@
       const own = measureNaturalLineHeightPx(ecs.fontFamily, sizePx, ecs.fontWeight, ecs.fontStyle);
       if (own) el.style.lineHeight = `${(own * ratio).toFixed(3)}px`;
     }
+    // A page break typed after text (`<p>text<hr page-break/></p>`, which
+    // parses into this block followed by the <hr>) is a character on the
+    // paragraph's last line, and it has no run of its own: the HTML leaves
+    // it outside every <span> and the docx gives its `<w:br>` run no rPr, so
+    // it is in the paragraph style's font. That makes the line as tall as
+    // that font's spaced height. On a Common App doc a 12pt Lato paragraph
+    // in the Subtitle style (15pt Arial) ends in one: Docs' caret puts its
+    // last line 24.7px below the first (CSS: 22.08), and that line sat
+    // 3.35px high. A zero-width ::after in the style's font (rule in
+    // rebuildMirror) grows the line the same way and leaves the text
+    // untouched for every walker: -0.85 afterwards, the page's other lines
+    // -0.31 to -0.89. Only the break glyph does this: a paragraph whose end
+    // mark alone is bigger (12pt mark, 11pt "Honor 1" on the same doc)
+    // sits where its text puts it.
+    const next = blockEl.nextElementSibling;
+    if (
+      next &&
+      next.tagName === "HR" &&
+      /page-break-before\s*:\s*always/i.test(next.getAttribute("style") || "") &&
+      (blockEl.textContent || "").trim() &&
+      (Math.abs(blockFontSizePx - run.fontSizePx) >= FONT_SIZE_TIE_EPSILON_PX ||
+        fontKeyOf(origFamily, cs.fontWeight, cs.fontStyle) !== runKey)
+    ) {
+      const brk = measureNaturalLineHeightPx(origFamily, blockFontSizePx, cs.fontWeight, cs.fontStyle);
+      if (brk) {
+        blockEl.dataset.gdtBreakGlyph = "1";
+        blockEl.style.setProperty("--gdt-break-family", origFamily);
+        blockEl.style.setProperty("--gdt-break-size", `${blockFontSizePx}px`);
+        blockEl.style.setProperty("--gdt-break-weight", cs.fontWeight);
+        blockEl.style.setProperty("--gdt-break-style", cs.fontStyle);
+        blockEl.style.setProperty("--gdt-break-lh", `${(brk * ratio).toFixed(3)}px`);
+      }
+    }
     blockEl.style.fontSize = `${run.fontSizePx}px`;
     // And the family: left as the block's own (the export's plain
     // "Calibri", which isn't the registered "docs-Calibri" the runs use),
@@ -1545,7 +1578,18 @@
     // renderHighlightBoxes' own ensurePositioned would apply anyway, with
     // the boxes' offsets computed against this element's shifted rect.
     blockEl.style.position = "relative";
-    blockEl.style.top = `${(-(lineHeightPx - natural) / 2).toFixed(3)}px`;
+    // And the font's own line gap (natural height minus ascent+descent)
+    // goes entirely *above* the ascent, where CSS splits it half and half:
+    // Docs' caret for an 11pt Arial line is 16.86px, the natural height
+    // with the gap, and its glyphs sit half the gap lower than CSS puts
+    // them. Calibri's gap is 0.22em, so its Title (26pt) sat 4.0px high and
+    // H1 2.1px (predicted 3.8 and 2.1), and Arial's 0.0325em left a 72pt line
+    // 1.9px high. With the half gap added, Calibri's lines on the QA doc's
+    // first page measure -0.26 to +0.57 by ink and the 36-72pt Arial lines
+    // -0.2 to -0.36. Lato has no gap, so its documents don't move.
+    const contentArea = measureContentAreaPx(run.fontFamily, run.fontSizePx, run.fontWeight, run.fontStyle);
+    const halfGap = contentArea ? Math.max(0, natural - contentArea) / 2 : 0;
+    blockEl.style.top = `${(-(lineHeightPx - natural) / 2 + halfGap).toFixed(3)}px`;
 
     // An inline image sits on the baseline, and Docs gives its line the
     // text's full below-baseline part (line height minus ascent, i.e. all
@@ -2394,6 +2438,7 @@
   // of the span for the residual to say much about them.
   const MIN_FLAGGED_SPAN_SHARE = 0.25;
   const MAX_ORIGIN_CORRECTION_PX = 200;
+  const MIN_TEXT_BAND_PX = 3;
 
   // Top edge (in CSS px from the page's top) of each horizontal band of
   // ink on a rendered page. One band is normally one line of text; an
@@ -2432,11 +2477,16 @@
       if (ink) {
         if (runStart < 0) runStart = y;
       } else if (runStart >= 0) {
-        tops.push(runStart / devicePerCss);
+        // A rule (a paragraph border, a table's top edge) is a band of its
+        // own, 1px tall, and pairing is line i to band i, so one rule puts
+        // every later line a band out: a Title's bottom border 38px under
+        // it left the QA doc's first page uncalibrated after one line.
+        // Text bands there are 10-30px tall.
+        if ((y - runStart) / devicePerCss >= MIN_TEXT_BAND_PX) tops.push(runStart / devicePerCss);
         runStart = -1;
       }
     }
-    if (runStart >= 0) tops.push(runStart / devicePerCss);
+    if (runStart >= 0 && (canvas.height - runStart) / devicePerCss >= MIN_TEXT_BAND_PX) tops.push(runStart / devicePerCss);
     return tops;
   }
 
@@ -2620,6 +2670,7 @@
     // what says *which* font is wrong; this is what says by how much.
     const spanReal = bands[usable - 1] - bands[0];
     const spanMirror = lines[usable - 1].top - lines[0].top;
+
     return { byFont, originShift, usable, spanReal, spanMirror };
   }
 
@@ -2962,6 +3013,10 @@
         scaledStyle += `\n${sel.map((x) => `a ${x}`).join(",")}{display:inline;line-height:inherit;padding:0;margin:0}`;
       }
     }
+    // The page-break glyph's box (see normalizeBlockEl).
+    scaledStyle +=
+      '\n[data-gdt-break-glyph]::after{content:"\\200B";font-family:var(--gdt-break-family);font-size:var(--gdt-break-size);' +
+      "font-weight:var(--gdt-break-weight);font-style:var(--gdt-break-style);line-height:var(--gdt-break-lh)}";
     styleEl.textContent = scaledStyle;
 
     // Every page in a Docs document has the same box, so one printable

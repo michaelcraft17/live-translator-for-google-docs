@@ -109,6 +109,29 @@ and only re-lays out for a genuine window resize.
   without a minimum height (`height:0`, as in the QA doc's tables) are left
   alone: Docs doesn't round them, and rounding put every line below the
   QA doc's first table 1.26px low.
+- **A font's line gap goes above the text.** Docs puts the whole line
+  gap (natural height minus ascent and descent) above the ascent, where
+  CSS splits it half above and half below. Docs' caret includes the gap: it is 16.86px for 11pt Arial, and
+  42.3px for a 26pt Calibri Title. Calibri's gap is 0.22em, so its Title
+  sat 4.0px high and Heading 1 2.1px high. Arial's gap is 0.0325em, which
+  left a 72pt line 1.9px high. Blocks now move down by half their font's
+  gap. By ink on the QA doc's first page, Calibri lines measure −0.26 to
+  +0.57 and the 36–72pt Arial lines −0.2 to −0.36. Lato has no gap, so
+  the Common App doc doesn't move. A caret-based check reads Calibri
+  lines about 0.22 × size low; that's the caret box, not the text.
+- **Calibration ignores rules on the page.** A paragraph border or a
+  table edge is a 1px band of ink. Calibration pairs line i with band i,
+  so a Title's bottom border put every later line one band out, and the
+  QA doc's first page never calibrated. Bands under 3px are dropped; text
+  bands there are 10–30px tall.
+- **A page break after text makes its line as tall as the paragraph
+  style's font.** The break is a character on the paragraph's last line
+  with no run of its own, so it is in the style's font (15pt Arial for a
+  Subtitle paragraph whose text is 12pt Lato). The mirror gives that line a
+  zero-width `::after` in the same font, so the line grows as it does in
+  Docs. The line had been 3.35px high; it is −0.85 now. A paragraph whose end
+  mark alone is bigger is not affected (measured: it sits where its text
+  puts it).
 - **A calibrated header shift really moves the body.** It was set as a
   plain inline `padding-top`, which the page-box rule's `!important`
   padding overrode, so the body never moved; each calibration pass measured
