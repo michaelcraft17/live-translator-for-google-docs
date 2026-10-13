@@ -86,25 +86,101 @@ and only re-lays out for a genuine window resize.
 - **Dropdown chips** export as bare link-styled runs (`#0000ee`, underlined,
   no `<a>`). They get the pill's padding (5px / 16px / 4px) and a 22.5px
   inline-block line height, because a chip line is taller than a text line
-  in Docs; without it the mirror lost ~2px per chip line.
+  in Docs; without it the mirror lost ~2px per chip line. That line height
+  is `!important` (except inside a real link): a chip after a label in
+  another font ("Timing of participation: All Year") counts as a
+  different-font run and got its own inline 19.4px line height, so 61 of
+  80 chip lines on a Common App doc were 20.4px instead of 22.5.
 - **Soft line breaks at the end of a paragraph** (`<br>` last in its block)
   get a second `<br>`: Docs draws a blank line for them, a browser doesn't.
   An answer box ending in one was 17px short in the mirror.
-- **Tables get a 1px gap below them.** Measured against the real page, the
-  line after each answer box sits ~1px lower than the collapsed-border box
-  implies; over a page of 5–6 boxes that is enough to put the lines at the
-  foot on the wrong side of a page break.
+- **A row's minimum height is measured inside its borders.** Docs keeps
+  the export's `<tr>` `height:` clear of the borders; a collapsed-border CSS
+  row counts half of each border in it, so each such row (every Common App
+  answer box) was 1px short. This replaces an earlier blanket 1px gap under
+  every table, which put the line after a table without a minimum height
+  1px low each time (+6px after six tables on a test page, +1.2–1.8px on
+  the QA doc's page 5).
+- **A row with a minimum height rounds up to a whole pixel**, as Docs
+  lays it out: on 23 Common App answer boxes the real borders were
+  0.35–1.0px further apart than the mirror's (49.53 → 50, 67.13 → 68,
+  137.53 → 138), so lines below them drifted up to 4px by a page's foot.
+  With rounding, 302 of 310 paired lines sit within 1px (189 before). Rows
+  without a minimum height (`height:0`, as in the QA doc's tables) are left
+  alone: Docs doesn't round them, and rounding put every line below the
+  QA doc's first table 1.26px low.
+- **A calibrated header shift really moves the body.** It was set as a
+  plain inline `padding-top`, which the page-box rule's `!important`
+  padding overrode, so the body never moved; each calibration pass measured
+  the same error again and added it on (8.04px a pass, up to 193px), and
+  the budget shrank by the full amount. On a Common App doc every page from
+  the second held ~670px instead of 864px, so pages broke a block early
+  and the doc fell further out of step page by page.
+- **Calibration measures a line from the paragraph's own font.** A run in
+  another family starts its box at its own font's ascent: a 🡪 (Noto Sans
+  Symbols, ascent 28px) in a Lato heading (ascent 18px) starts 9px above
+  the Lato text. Taken as the line top, it made a page that opens with
+  "Education 🡪 Honors section" read as an 8px header shift, and every
+  page from the second sat 7.5px low. Other-font runs, chips included, are
+  now left out of a line's top whenever the line has text in the
+  paragraph's own font.
 - **The blank paragraph after an explicit page break** is one single-spaced
   line at the default size (17.6px), not a line in the paragraph's own
   (heading-sized) font. The export splits the paragraph holding the break in
   two, and the second half is only its end mark; at 25.8px it left the whole
   next page 8px low.
+- **A page break at the very start of its paragraph** exports as
+  `<hr page-break/>` followed by that paragraph's own empty `<p class>`.
+  Docs draws that paragraph (break and end mark on one line) at the foot of
+  the page before the break, and the next page starts with the following
+  paragraph at the content top. Put after the break, it opened page 8 of the
+  test document with a blank line and kept the next paragraph's space-before:
+  the whole page sat 30px low. The classless `<p>` the parser makes for a
+  break after text is the case above and is left alone.
 - **Blank paragraphs at a page's foot stay there** when the font's natural
   line height (17.6px for 11pt Lato, rounded up to 18) fits, even though the
   1.15-spaced line is 20.2px: Docs lets the leading spill into the margin.
   Blanks with 18.9px of room stayed; ones with 17.7, 16.6 and 8px moved on.
 - **One-row answer boxes** that don't fit the rest of a page start the next
   page whole when they're under four lines tall (Docs won't split them).
+- **Header, footer and footnotes are taken out of the body.** The export
+  wraps them in top-level `<div>`s (header first; footer, `<hr>` and
+  footnotes last). Cloned into the mirror, a one-line header put every line
+  of page 1 16.87px low. Footnote text goes to the panel as its own entries;
+  the in-text reference `[1]` is drawn as a bare superscript `1` and kept out
+  of the sentence text.
+- **A footnote takes room from the page its reference is on.** Docs draws it
+  at the page foot, 10pt below the body, and the body ends that much higher.
+  Without it a one-line paragraph ending 24px above the bottom margin stayed
+  on a page that Docs had already filled, and every highlight after it was
+  a paragraph out (5.5–8.8px on the next three pages). The footnote is laid
+  out like a body paragraph to get its height.
+- **A paragraph's line height follows the run with most of its text**, not
+  its largest run, and a run in another font or size gets its own spaced
+  line height. Docs gives each line the tallest of its runs' heights: one
+  14pt full stop in an 11pt paragraph makes that one line 24.3px and leaves
+  the rest at 19.4px. The mirror used to make every line 24.7px.
+- **List spacing and bordered paragraphs take their spacing from the
+  docx.** The HTML writes the same `padding-bottom` on every `<li>` whether
+  or not Docs collapses list spacing; the docx writes what Docs draws (0
+  between collapsed items). A paragraph with a bottom border loses its space
+  after in the HTML (its padding is the border's); the docx keeps it (a
+  Title's 15pt). Without the docx, consecutive list items fall back to 0.
+- **Superscript and subscript don't grow the line** (`line-height: 0` on
+  them and everything inside them, such as a footnote number's link); CSS
+  raised the line holding "H2O" 5.5px and the paragraph 8.8px.
+- **Picture paragraphs are as tall as the picture.** A paragraph holding
+  only an image used to be pinned to one text line, so the text after it
+  rode up into the picture (52px under a 96px image). An image line also
+  gets Docs' 1pt gap above and the full leading below the baseline (CSS
+  hangs only half there): 103.4px for a 96px image at 11pt x1.15.
+- **Soft line breaks count as a space** when splitting sentences: the
+  export's `<br>` has no text, so "Line one.<br>Line two" used to read as
+  one sentence "Line one.Line two". The mirror's sentence spans count each
+  `<br>` the same way, so offsets still match.
+- **"vs.", "e.g.", "i.e.", "cf." never end a sentence**, even before a
+  capital ("Cats vs. Dogs is a debate."); "etc.", "Inc." and the like still
+  do when the next word is capitalised.
 - **Page breaks follow Docs' widow/orphan control**: at least two lines of
   a paragraph on each side of a break, otherwise the lines (or a short
   paragraph, whole) move to the next page.

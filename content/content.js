@@ -110,6 +110,7 @@
    *   activeHighlightBoxes: HTMLElement[],
    *   lastSignature: string|null,
    *   lastBodyNode: Element|null,
+   *   lastFootnoteNodes: Map<string, Element>,
    *   lastStyleText: string,
    *   lastBodyClassAttr: string,
    *   mirror: { host: HTMLElement, shadow: ShadowRoot, styleEl: HTMLElement, container: HTMLElement }|null,
@@ -128,6 +129,7 @@
     activeHighlightBoxes: [],
     lastSignature: null,
     lastBodyNode: null,
+    lastFootnoteNodes: new Map(),
     lastStyleText: "",
     lastBodyClassAttr: "",
     headerFooter: null,
@@ -279,11 +281,15 @@
   // Titles always continue into the next word ("Dr. Smith"); the others
   // ("etc.", "e.g.") only when the next segment doesn't start a new sentence.
   const TITLE_ABBREV_RE = /(?:^|[\s("'“‘])(?:Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|Mt|Gen|Col|Capt|Lt|Sgt|Rev|Hon|Messrs|Mme|Mlle)\.$/;
-  const SOFT_ABBREV_RE = /(?:^|[\s("'“‘])(?:vs|etc|e\.g|i\.e|Inc|Ltd|Co|No|Fig|approx|cf|al)\.$/i;
+  // "vs.", "e.g.", "i.e." and "cf." always lead into more of the same
+  // sentence ("Cats vs. Dogs is a debate.", "E.g. Paris is big."), so they
+  // can't wait for a lowercase next word the way "etc." / "Inc." must.
+  const CONT_ABBREV_RE = /(?:^|[\s("'“‘])(?:vs|e\.g|i\.e|cf)\.$/i;
+  const SOFT_ABBREV_RE = /(?:^|[\s("'“‘])(?:etc|Inc|Ltd|Co|No|Fig|approx|al)\.$/i;
   const INITIAL_RE = /(?:^|[\s("'“‘])[A-Z]\.$/;
 
   function endsInAbbreviation(prev, next) {
-    if (TITLE_ABBREV_RE.test(prev) || INITIAL_RE.test(prev)) return true;
+    if (TITLE_ABBREV_RE.test(prev) || INITIAL_RE.test(prev) || CONT_ABBREV_RE.test(prev)) return true;
     return SOFT_ABBREV_RE.test(prev) && /^[a-z0-9]/.test(next);
   }
 
@@ -335,12 +341,58 @@
     return named.join("") + rest;
   }
 
+  // The export wraps everything that isn't in the body flow in top-level
+  // `<div>`s: the header first, then the body, then the footer, then an
+  // `<hr>` and one `<div>` per footnote. None of these sit in the flow on
+  // the real page (Docs draws them in the margins and at the page foot), but
+  // cloned into the mirror the header became an ordinary first paragraph:
+  // measured on a doc whose header is one 11pt line, every line of page 1
+  // sat 16.87px (that line) low, and the footer and footnotes added lines to
+  // the end. Body content is never a direct `<div>` child — paragraphs,
+  // headings, lists, tables and rules all sit straight under `<body>` — so
+  // every top-level `<div>` comes out, plus the `<hr>` that only introduces
+  // the footnotes. Footnote text is kept for the panel (header and footer
+  // text comes from the docx, see fetchHeaderFooterTexts).
+  function isFootnoteDiv(el) {
+    return el && el.tagName === "DIV" && !!el.querySelector('a[href^="#ftnt_ref"]');
+  }
+
   function parseExportedDocument(html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     const styleEl = doc.querySelector("style");
+    const footnoteTexts = [];
+    // Each footnote's own `<div>`, keyed by the `href` of the reference
+    // that points at it ("#ftnt1"), for the paginator: Docs fits the
+    // footnote on the page of its reference (see FOOTNOTE_SEPARATOR_PT).
+    const footnoteNodes = new Map();
+    for (const el of Array.from(doc.body.children)) {
+      if (el.tagName === "HR" && isFootnoteDiv(el.nextElementSibling)) {
+        el.remove();
+      } else if (el.tagName === "DIV") {
+        if (isFootnoteDiv(el)) {
+          const back = el.querySelector('a[href^="#ftnt_ref"]');
+          const node = el.cloneNode(true);
+          node.querySelectorAll('a[href^="#ftnt_ref"]').forEach((a) => {
+            a.textContent = a.textContent.replace(/^\[(\d+)\]$/, "$1");
+          });
+          footnoteNodes.set(back.getAttribute("href").replace("#ftnt_ref", "#ftnt"), node);
+          el.querySelectorAll('a[href^="#ftnt_ref"]').forEach((a) => a.remove());
+          const text = leafText(el).replace(/^\s+/, "").trim();
+          if (text) footnoteTexts.push(text);
+        }
+        el.remove();
+      }
+    }
+    // The reference itself stays in the body as `<sup><a>[1]</a></sup>`,
+    // but Docs draws it as a bare superscript "1".
+    doc.body.querySelectorAll('a[href^="#ftnt"]').forEach((a) => {
+      a.textContent = a.textContent.replace(/^\[(\d+)\]$/, "$1");
+    });
     return {
       styleText: styleEl ? hoistNamedStyleRules(styleEl.textContent) : "",
       bodyNode: doc.body,
+      footnoteTexts,
+      footnoteNodes,
     };
   }
 
@@ -374,11 +426,28 @@
     return out;
   }
 
+  // A soft line break (Shift+Enter) exports as <br>, which has no text, so
+  // "Line one.<br>Line two" read as "Line one.Line two": one sentence, and
+  // the translator saw the two words glued together. A <br> counts as one
+  // space here and in instrumentParagraphMirror, so the offsets still line up.
   function leafText(node) {
-    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
-    let out = "";
+    return textEntries(node).map((e) => e.text).join("");
+  }
+
+  // A footnote reference is skipped altogether: the mirror still draws its
+  // number (for the line's width), but "late.1 He sat" isn't text to
+  // translate, and dropping it in both places keeps the offsets in step.
+  function textEntries(node) {
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+      acceptNode(n) {
+        if (n.tagName === "A" && /^#ftnt\d/.test(n.getAttribute("href") || "")) return NodeFilter.FILTER_REJECT;
+        if (n.nodeType === Node.TEXT_NODE || n.tagName === "BR") return NodeFilter.FILTER_ACCEPT;
+        return NodeFilter.FILTER_SKIP;
+      },
+    });
+    const out = [];
     let n;
-    while ((n = walker.nextNode())) out += n.data;
+    while ((n = walker.nextNode())) out.push({ node: n, text: n.nodeType === Node.TEXT_NODE ? n.data : " " });
     return out;
   }
 
@@ -420,15 +489,20 @@
     );
   }
 
-  // Header first, then the body, then the footer — the order they're read
-  // in. Translations already in hand are carried across by matching text,
+  // Header first, then the body, then footnotes, then the footer — the
+  // order they're read in. Translations already in hand are carried across by matching text,
   // so a poll that only changed the body doesn't re-translate the header.
   function composeParagraphs(bodyParagraphs) {
     const headerTexts = (state.headerFooter && state.headerFooter.header) || [];
     const footerTexts = (state.headerFooter && state.headerFooter.footer) || [];
     const marginal = (texts, place, prefix) =>
       texts.map((text, i) => makeParagraph(`${prefix}${i}`, "p", text, place, null));
-    const next = [...marginal(headerTexts, "header", "h"), ...bodyParagraphs, ...marginal(footerTexts, "footer", "f")];
+    const next = [
+      ...marginal(headerTexts, "header", "h"),
+      ...bodyParagraphs,
+      ...marginal(state.footnoteTexts || [], "footnote", "n"),
+      ...marginal(footerTexts, "footer", "f"),
+    ];
     const previousByText = new Map();
     for (const p of state.paragraphs) {
       if (!previousByText.has(p.text)) previousByText.set(p.text, p);
@@ -594,6 +668,79 @@
     return { texts, sections: sections.filter((sec) => sec.num > 1 && sec.end >= sec.start) };
   }
 
+  // Each docx paragraph's space before/after in pt, in the same order as
+  // parseDocxColumns' `texts`: the paragraph's own `w:spacing`, else its
+  // style's (following `basedOn`), else the docDefaults'. The HTML export
+  // loses two things that only this has:
+  //  * Whether Docs skips the spacing between list items. A list whose
+  //    items each declare 10pt after can be drawn with none between them
+  //    (spacing mode "collapse lists") or with all of it, and the HTML
+  //    writes `padding-bottom:10pt` on every `<li>` either way. The docx
+  //    writes what Docs actually draws: `w:after="0"` on the collapsed ones.
+  //    Measured: three collapsed items at a 19px pitch, and a nested item
+  //    13.3px further down than the mirror put it where nothing collapsed.
+  //  * The space after a paragraph with a bottom border. The export spends
+  //    the paragraph's padding on the border's own padding and drops the
+  //    space after: a Title's 15pt went missing, and all of page 1 sat 20px
+  //    high.
+  function parseDocxParagraphSpacing(docXml, stylesXml) {
+    const parse = (xml) => {
+      const d = xml && new DOMParser().parseFromString(xml, "application/xml");
+      return d && !d.querySelector("parsererror") ? d : null;
+    };
+    const doc = parse(docXml);
+    if (!doc) return null;
+    const styles = parse(stylesXml);
+    const childNamed = (el, name) => el && Array.from(el.children).find((c) => c.tagName === name);
+    const spacingOf = (pPr) => {
+      const s = childNamed(pPr, "w:spacing");
+      const out = {};
+      if (!s) return out;
+      for (const side of ["before", "after"]) {
+        const v = s.getAttribute(`w:${side}`);
+        // "Auto" spacing is Word's HTML-style default, not a number.
+        if (v !== null && s.getAttribute(`w:${side}Autospacing`) !== "1") out[side] = parseInt(v, 10) / 20;
+      }
+      return out;
+    };
+    const byId = new Map();
+    let defaultId = null;
+    let docDefault = {};
+    if (styles) {
+      for (const st of Array.from(styles.getElementsByTagName("w:style"))) {
+        if (st.getAttribute("w:type") !== "paragraph") continue;
+        const based = childNamed(st, "w:basedOn");
+        byId.set(st.getAttribute("w:styleId"), {
+          spacing: spacingOf(childNamed(st, "w:pPr")),
+          basedOn: based && based.getAttribute("w:val"),
+        });
+        if (st.getAttribute("w:default") === "1") defaultId = st.getAttribute("w:styleId");
+      }
+      const pd = styles.getElementsByTagName("w:pPrDefault")[0];
+      docDefault = spacingOf(pd && childNamed(pd, "w:pPr"));
+    }
+    const fromStyle = (id, side) => {
+      for (let hops = 0; id && hops < 10; hops++) {
+        const st = byId.get(id);
+        if (!st) break;
+        if (st.spacing[side] !== undefined) return st.spacing[side];
+        id = st.basedOn;
+      }
+      return undefined;
+    };
+    return Array.from(doc.getElementsByTagName("w:p")).map((p) => {
+      const pPr = childNamed(p, "w:pPr");
+      const direct = spacingOf(pPr);
+      const pStyle = childNamed(pPr, "w:pStyle");
+      const styleId = pStyle ? pStyle.getAttribute("w:val") : defaultId;
+      const out = {};
+      for (const side of ["before", "after"]) {
+        out[side] = direct[side] ?? fromStyle(styleId, side) ?? docDefault[side] ?? 0;
+      }
+      return out;
+    });
+  }
+
   async function fetchHeaderFooterTexts(docId) {
     const now = Date.now();
     if (now < exportFetchBackoffUntil) return null; // already rate-limited; don't make it worse
@@ -643,14 +790,16 @@
     let columns = null;
     let defaults = null;
     const stylesEntry = zip.entries.find((e) => e.name === "word/styles.xml");
+    let stylesXml = null;
     if (stylesEntry) {
-      const stylesXml = await readZipEntryText(bytes, zip.view, stylesEntry);
+      stylesXml = await readZipEntryText(bytes, zip.view, stylesEntry);
       defaults = stylesXml ? parseDocxDefaults(stylesXml) : null;
     }
     const docEntry = zip.entries.find((e) => e.name === "word/document.xml");
     if (docEntry) {
       const xml = await readZipEntryText(bytes, zip.view, docEntry);
       columns = xml ? parseDocxColumns(xml) : null;
+      if (columns) columns.spacing = parseDocxParagraphSpacing(xml, stylesXml);
       const mar = xml && Array.from(xml.matchAll(/<w:pgMar\b[^>]*>/g)).pop();
       const sz = xml && Array.from(xml.matchAll(/<w:pgSz\b[^>]*>/g)).pop();
       const twips = (tag, attr) => {
@@ -1049,14 +1198,20 @@
   // The `width` the exported (already px-scaled) stylesheet declares for a
   // table cell's class(es), or 0 when it declares none.
   function declaredCellWidthPx(cell, styleText) {
-    let width = 0;
-    for (const cn of (cell.getAttribute("class") || "").split(/\s+/).filter(Boolean)) {
+    return declaredClassPx(cell, styleText, "width");
+  }
+
+  // The px value of `prop` set by the element's own classes in the scaled
+  // export stylesheet (last class wins), or 0 when none sets it.
+  function declaredClassPx(el, styleText, prop) {
+    let value = 0;
+    for (const cn of (el.getAttribute("class") || "").split(/\s+/).filter(Boolean)) {
       const re = new RegExp("\\." + cn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\{([^}]*)\\}");
       const m = styleText.match(re);
-      const w = m && m[1].match(/(?:^|;)\s*width:\s*([\d.]+)px/);
-      if (w) width = parseFloat(w[1]);
+      const v = m && m[1].match(new RegExp(`(?:^|;)\\s*${prop}:\\s*([\\d.]+)px`));
+      if (v) value = parseFloat(v[1]);
     }
-    return width;
+    return value;
   }
 
   function resolveMirrorFontFamily(fontFamily) {
@@ -1129,6 +1284,32 @@
     return ratio * fontSizePx;
   }
 
+  // A font's CSS content area (ascent + descent, no line gap): the height
+  // of an inline box's rect, which is what CSS splits a line's leading
+  // around. Probed at the same large size as the natural height above.
+  const contentAreaRatioCache = new Map();
+  function measureContentAreaPx(fontFamily, fontSizePx, fontWeight, fontStyle) {
+    const key = fontKeyOf(fontFamily, fontWeight, fontStyle);
+    let ratio = contentAreaRatioCache.get(key);
+    if (ratio === undefined) {
+      const box = document.createElement("div");
+      box.style.cssText = "position:absolute;visibility:hidden;white-space:nowrap;line-height:normal";
+      const probe = document.createElement("span");
+      probe.style.fontFamily = resolveMirrorFontFamily(fontFamily);
+      probe.style.fontSize = `${NATURAL_LH_PROBE_PX}px`;
+      probe.style.fontWeight = fontWeight || "normal";
+      probe.style.fontStyle = fontStyle || "normal";
+      probe.textContent = "Mg";
+      box.appendChild(probe);
+      document.body.appendChild(box);
+      const rect = probe.getClientRects()[0];
+      ratio = rect ? rect.height / NATURAL_LH_PROBE_PX : 0;
+      box.remove();
+      contentAreaRatioCache.set(key, ratio);
+    }
+    return ratio * fontSizePx;
+  }
+
   // The font a block's *text* is actually drawn in, which is not
   // necessarily the font the block element itself computes to. Google's
   // export puts paragraph-level styling on the block's class but run-level
@@ -1142,26 +1323,35 @@
   // instead made every heading's line box ~1.8px wrong, in whichever
   // direction that particular heading's style happened to disagree.
   //
-  // Where runs disagree with each other (a paragraph mixing sizes), the
-  // largest wins: that's the one that sets the line's height.
+  // Where runs disagree with each other (a paragraph mixing sizes or
+  // fonts), the one holding most of the text wins, not the largest. The
+  // largest used to win, which gave *every* line the big run's height:
+  // an 11pt paragraph with one 14pt full stop got 24.7px lines where Docs
+  // draws 19.4px ones, 5.7px too tall per line (measured over its three
+  // lines: +8.8, +14.5, +20.2px), and every page after it slid down. Docs
+  // only grows the line the big run sits on, and by little: 21px for that
+  // line against 19.4 (Docs rounds to whole pixels). CSS gives the same
+  // ~1.4px on its own once the block's line height is the 11pt one,
+  // because the 14pt span inherits the px line height and only its taller
+  // glyphs push the line box out.
   //
-  // Where runs are the *same* size but disagree on weight or style — a
-  // short bold label ("Feasibility (20 points): ") leading into a long
-  // regular sentence, extremely common in translated documents — size
-  // alone doesn't pick a winner. Break that tie by character count
-  // instead of by DOM order: the run holding most of the line's actual
-  // text is the one whose metrics the line was really laid out from.
-  // Encountered-first would silently prefer the label just because it
-  // comes first, even though it might be one word out of a full sentence.
+  // Character count also settles runs of the *same* size that differ in
+  // weight or style — a short bold label ("Feasibility (20 points): ")
+  // leading into a long regular sentence, extremely common in translated
+  // documents. Encountered-first would silently prefer the label just
+  // because it comes first, even though it might be one word out of a
+  // full sentence. Equal counts go to the larger size.
   // Confirmed on a real EB Garamond doc that regular/bold happen to share
   // identical natural-height metrics there, so encountered-first did no
   // damage in that case — but nothing guarantees that of every font, and
   // Google Fonts weights routinely do carry their own hhea/OS2 metrics.
   const FONT_SIZE_TIE_EPSILON_PX = 0.1;
+  // Docs' gap above an inline image (1pt), measured on lines holding a
+  // 96px and a 72px image at 11pt and 24pt; see normalizeBlockEl.
+  const IMAGE_TOP_GAP_PX = 4 / 3;
   function dominantRunFont(blockEl) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
-    let best = null;
-    let bestChars = 0;
+    const runs = new Map();
     let n;
     while ((n = walker.nextNode())) {
       const chars = n.data ? n.data.trim().length : 0;
@@ -1171,15 +1361,25 @@
       const cs = getComputedStyle(el);
       const fontSizePx = parseFloat(cs.fontSize);
       if (!fontSizePx) continue;
-      if (!best || fontSizePx > best.fontSizePx + FONT_SIZE_TIE_EPSILON_PX) {
-        best = { fontSizePx, fontFamily: cs.fontFamily, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle };
-        bestChars = chars;
-      } else if (Math.abs(fontSizePx - best.fontSizePx) <= FONT_SIZE_TIE_EPSILON_PX && chars > bestChars) {
-        best = { fontSizePx, fontFamily: cs.fontFamily, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle };
-        bestChars = chars;
+      const key = `${fontSizePx.toFixed(1)}|${cs.fontFamily}|${cs.fontWeight}|${cs.fontStyle}`;
+      const run = runs.get(key);
+      if (run) run.chars += chars;
+      else runs.set(key, { fontSizePx, fontFamily: cs.fontFamily, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle, chars });
+    }
+    let best = null;
+    for (const run of runs.values()) {
+      if (
+        !best ||
+        run.chars > best.chars ||
+        (run.chars === best.chars && run.fontSizePx > best.fontSizePx + FONT_SIZE_TIE_EPSILON_PX)
+      ) {
+        best = run;
       }
     }
-    if (best) return best;
+    if (best) {
+      const { chars, ...font } = best;
+      return font;
+    }
     // An *empty* paragraph still occupies a full line on screen, at the
     // size of the run it would contain — and the export does carry that
     // run, as an empty `<span>` with the class that names the font. No
@@ -1282,11 +1482,43 @@
     // dominant run's: an 11pt sentence ending in a 12pt full stop became
     // all-12pt, wrapped a line early, and pushed the rest of the page down.
     // So pin whatever is currently inherited before touching the block.
+    // Superscript and subscript runs (`vertical-align: super|sub` in the
+    // export, and the `<sup>` around a footnote number) don't make a line
+    // any taller in Docs, but CSS raises their inline box and grows the
+    // line box around it: "Water is H2O and E = mc2" came out with its
+    // first line 5.5px low and the paragraph 8.8px taller than the real
+    // one. A zero line height takes them out of the line-box calculation.
+    //
+    // A run in a different font or size gets its own spaced line height, so
+    // only the line it sits on grows, to that run's height: Docs gives each
+    // line the tallest of its runs' natural heights times the spacing. The
+    // 11pt paragraph with a 14pt full stop has one 24.3px line (14pt x
+    // 1.15 = 24.7) and then 19.4px ones; inheriting the block's px line
+    // height instead, the 14pt span left that line at 20.4px.
     const origFamily = cs.fontFamily;
+    const runKey = fontKeyOf(run.fontFamily, run.fontWeight, run.fontStyle);
     for (const el of blockEl.querySelectorAll("*")) {
       const ecs = getComputedStyle(el);
       if (Math.abs(parseFloat(ecs.fontSize) - blockFontSizePx) < 0.01) el.style.fontSize = `${blockFontSizePx}px`;
       if (ecs.fontFamily === origFamily) el.style.fontFamily = origFamily;
+      if (ecs.verticalAlign === "super" || ecs.verticalAlign === "sub") {
+        el.style.lineHeight = "0";
+        el.dataset.gdtScript = "1";
+        continue;
+      }
+      // Nor anything inside one: the footnote number's `<a>` within its
+      // `<sup>` got its own 16.2px line height here, was raised with the
+      // `<sup>`, and grew "Dr. Smith arrived late.¹" to 22.3px (Docs: 19.4).
+      if (el.parentElement && el.parentElement.closest("[data-gdt-script]")) {
+        el.style.lineHeight = "0";
+        continue;
+      }
+      const ownText = Array.from(el.childNodes).some((c) => c.nodeType === Node.TEXT_NODE && c.data.trim());
+      const sizePx = parseFloat(ecs.fontSize);
+      if (!ownText || !sizePx) continue;
+      if (Math.abs(sizePx - run.fontSizePx) < FONT_SIZE_TIE_EPSILON_PX && fontKeyOf(ecs.fontFamily, ecs.fontWeight, ecs.fontStyle) === runKey) continue;
+      const own = measureNaturalLineHeightPx(ecs.fontFamily, sizePx, ecs.fontWeight, ecs.fontStyle);
+      if (own) el.style.lineHeight = `${(own * ratio).toFixed(3)}px`;
     }
     blockEl.style.fontSize = `${run.fontSizePx}px`;
     // And the family: left as the block's own (the export's plain
@@ -1315,6 +1547,29 @@
     blockEl.style.position = "relative";
     blockEl.style.top = `${(-(lineHeightPx - natural) / 2).toFixed(3)}px`;
 
+    // An inline image sits on the baseline, and Docs gives its line the
+    // text's full below-baseline part (line height minus ascent, i.e. all
+    // the leading) plus 1pt above the image. CSS hangs only half the
+    // leading below the baseline, so a picture's line came out short:
+    // measured with Docs' selection overlay, an 11pt x1.15 line holding a
+    // 96px image is 103.4px (CSS: 100.6), the same paragraph at 24pt grew
+    // by 7.0px (model: +7.2), and a 72px image in a single-spaced table
+    // cell made a 77.0px row (model: 76.9). Text after each picture sat
+    // 2.8px high. A bottom margin of the other half-leading on the image's
+    // box (an inline-block's baseline is its bottom margin edge) restores
+    // the leading below, and 1pt of top margin the gap above.
+    const images = blockEl.querySelectorAll("img");
+    if (images.length) {
+      const contentArea = measureContentAreaPx(run.fontFamily, run.fontSizePx, run.fontWeight, run.fontStyle);
+      const halfLeading = contentArea ? Math.max(0, (lineHeightPx - contentArea) / 2) : 0;
+      for (const img of images) {
+        const parent = img.parentElement;
+        const frame = parent && parent !== blockEl && getComputedStyle(parent).display === "inline-block" ? parent : img;
+        frame.style.marginTop = `${IMAGE_TOP_GAP_PX}px`;
+        frame.style.marginBottom = `${halfLeading.toFixed(3)}px`;
+      }
+    }
+
     // Docs uses empty paragraphs as its vertical spacing (rather than
     // "space before/after") in plenty of documents, and the export gives
     // every one of them a hard `height: 11pt` — a stock number, not the
@@ -1327,8 +1582,11 @@
     // no line boxes, so CSS would collapse it to nothing — so it's
     // replaced with the line height computed just above.
     // One that holds soft line breaks (see padTrailingLineBreaks) is one
-    // line per break, not one line.
-    if (!(blockEl.textContent || "").trim()) {
+    // line per break, not one line. A paragraph holding only a picture has
+    // no text either, but its line is the picture's height: pinned to one
+    // text line, the 96px image overflowed and everything after it rode up
+    // into it (52px on that page; 26px under a table cell's image).
+    if (!(blockEl.textContent || "").trim() && !images.length) {
       const lines = Math.max(1, blockEl.querySelectorAll("br").length);
       let px = lineHeightPx * lines;
       // The export cuts the paragraph holding a page break in two
@@ -1363,7 +1621,10 @@
   // even though every `<li>` shares a class declaring the usual 16px/16px
   // (measured: a real, on-screen 19.4px item pitch — exactly one line —
   // where the declared padding would predict ~51px). So that one pair
-  // collapses to 0, not to max().
+  // collapses to 0, not to max(). That doc's lists were in Docs' "collapse
+  // lists" spacing mode; in the other mode the declared spacing is drawn in
+  // full, so when the docx is in hand its resolved numbers are used instead
+  // (see applyDocxSpacing) and this is only the fallback.
   //
   // A list's *outer* boundaries are not special and must NOT be excluded
   // from the max() rule — that was a real bug here. An earlier version
@@ -1404,11 +1665,30 @@
     const finalTop = declared.map((d) => d.top);
     const finalBottom = declared.map((d) => d.bottom);
     for (let i = 1; i < list.length; i++) {
-      if (tableBetween(list[i - 1], list[i])) continue;
-      const betweenListItems = list[i - 1].tagName === "LI" && list[i].tagName === "LI";
-      const collapsed = betweenListItems ? 0 : Math.max(finalBottom[i - 1], finalTop[i]);
-      finalBottom[i - 1] = 0;
-      finalTop[i] = collapsed;
+      const prev = list[i - 1];
+      const next = list[i];
+      if (tableBetween(prev, next)) continue;
+      // With the docx's own numbers for both items (applyDocxSpacing) the
+      // collapse is already in them: 0 where Docs skips list spacing, the
+      // real value where it doesn't. Only without them is "nothing between
+      // two list items" the best guess.
+      const betweenListItems =
+        prev.tagName === "LI" && next.tagName === "LI" && !(prev.dataset.gdtDocxSpacing && next.dataset.gdtDocxSpacing);
+      // A bordered paragraph's padding is the border's own and stays inside
+      // it; what collapses with the neighbour is its outside spacing.
+      const outerAfter = prev.dataset.gdtOuterAfter;
+      const outerBefore = next.dataset.gdtOuterBefore;
+      const above = outerAfter !== undefined ? Number(outerAfter) : finalBottom[i - 1];
+      const below = outerBefore !== undefined ? Number(outerBefore) : finalTop[i];
+      const collapsed = betweenListItems ? 0 : Math.max(above, below);
+      if (outerBefore !== undefined && outerAfter === undefined) {
+        // Above a top border: the gap goes on the paragraph before it.
+        finalBottom[i - 1] = collapsed;
+        finalTop[i] = declared[i].top;
+      } else {
+        finalBottom[i - 1] = outerAfter !== undefined ? declared[i - 1].bottom : 0;
+        finalTop[i] = collapsed + (outerBefore !== undefined ? declared[i].top : 0);
+      }
     }
     list.forEach((el, i) => {
       el.style.paddingTop = `${finalTop[i]}px`;
@@ -1609,12 +1889,22 @@
   // out 0.08px over budget here and was moved whole onto page 2, so its
   // highlight vanished on page 1 and appeared in the wrong place on 2.
   const FIT_SLOP_PX = 0.5;
+  // The gap Docs leaves between the body and a page's first footnote,
+  // around the separator rule. Measured on a page with one 10pt footnote
+  // (15.33px line, ending at the content bottom): a body line ending at
+  // 930.4px still fitted and one ending at 931.7px went to the next page,
+  // so the footnote area starts 28.3-29.6px above the bottom; 10pt + the
+  // footnote line is 28.67.
+  const FOOTNOTE_SEPARATOR_PT = 10;
   const WRAP_SLACK_PX = 1;
-  const TABLE_TRAILING_GAP_PX = 1;
 
-  function paginateBlocks(scratch, pageContainers, printableHeightsPx, placementLog) {
+  function paginateBlocks(scratch, pageContainers, printableHeightsPx, placementLog, footnotes) {
     let pageIndex = 0;
     let usedHeight = 0;
+    // Per page, less whatever that page's footnotes take (see walk).
+    const budgets = printableHeightsPx.slice();
+    const budgetAt = (i) => budgets[i] || budgets[budgets.length - 1];
+    const footnotePx = new Map(); // page index -> height of its footnotes
     const listCloneCache = new Map(); // original <ul>/<ol> -> { pageIndex, cloneEl }
 
     function cloneForCurrentPage(origListEl, parentContainer) {
@@ -1709,7 +1999,7 @@
       }
 
       while (pageIndex < pageContainers.length - 1) {
-        const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
+        const budget = budgetAt(pageIndex);
         if (usedHeight <= budget + FIT_SLOP_PX) break;
         // Space-after on the last block of a page is dropped, not carried:
         // a block whose only overshoot is its own trailing space still
@@ -1792,7 +2082,7 @@
       if (/^H[1-6]$/.test(leafEl.tagName) && usedHeight > 0 && pageIndex < pageContainers.length - 1) {
         const next = firstLeafAfter(leafEl);
         if (next) {
-          const pageBudget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
+          const pageBudget = budgetAt(pageIndex);
           const ncs = getComputedStyle(next);
           const line = parseFloat(ncs.lineHeight) || 0;
           const need = Math.min(next.getBoundingClientRect().height, (parseFloat(ncs.paddingTop) || 0) + 2 * line);
@@ -1802,7 +2092,7 @@
           }
         }
       }
-      const budget = printableHeightsPx[pageIndex] || printableHeightsPx[printableHeightsPx.length - 1];
+      const budget = budgetAt(pageIndex);
       const remaining = budget - usedHeight;
       const h = leafEl.getBoundingClientRect().height;
 
@@ -1939,9 +2229,78 @@
       return el.tagName === "HR" && /page-break-before\s*:\s*always/i.test(el.getAttribute("style") || "");
     }
 
+    // Docs puts a footnote at the foot of the page its reference lands on,
+    // and the body there gets that much less room: on the test document's
+    // page 6 a one-line paragraph whose line box ended at 936px (content
+    // bottom 960) went to page 7 because of the 10pt footnote below it,
+    // and the mirror, which had dropped the footnote, kept it — every
+    // highlight on pages 7-9 then sat one paragraph out (5.5px to 8.8px).
+    // The room is taken before the block is placed, so the line holding
+    // the reference has to fit above its own footnote; if the block ends
+    // up on a later page, the reservation follows it there.
+    function placeWithFootnotes(leafEl, listChain) {
+      const px = footnotes
+        ? Array.from(leafEl.querySelectorAll('a[href^="#ftnt"]')).reduce(
+            (sum, a) => sum + (footnotes.heights.get(a.getAttribute("href")) || 0),
+            0
+          )
+        : 0;
+      if (!px) {
+        placeLeaf(leafEl, listChain);
+        return;
+      }
+      // Taken before placing: a split moves the reference into a new node.
+      const ref = leafEl.querySelector('a[href^="#ftnt"]');
+      const firstPage = pageIndex;
+      addFootnotes(firstPage, px);
+      placeLeaf(leafEl, listChain);
+      const refPage = pageContainers.findIndex((c) => c.contains(ref));
+      if (refPage > firstPage) {
+        addFootnotes(firstPage, -px);
+        addFootnotes(refPage, px);
+      }
+    }
+
+    // The separator gap comes once per page, with its first footnote.
+    function addFootnotes(page, px) {
+      const total = (footnotePx.get(page) || 0) + px;
+      footnotePx.set(page, total);
+      const base = printableHeightsPx[page] || printableHeightsPx[printableHeightsPx.length - 1];
+      budgets[page] = base - (total > 0.01 ? total + footnotes.separatorPx : 0);
+    }
+
+    // A page break that is the first thing in its paragraph exports as
+    // `<hr page-break/><p class="…"></p>`: that `<p>` is the paragraph
+    // holding the break, and Docs draws it (break and end mark on one line)
+    // at the foot of the page *before* the break — on the test document
+    // the caret sat at 674px on page 7, and page 8 began with the next
+    // paragraph at the content top. Placed after the break instead, it
+    // took a line at the top of page 8 and kept the next paragraph's
+    // space-before, putting the whole page 30px low. A break after text
+    // in the same paragraph is different: the export's `<p>…<hr/></p>`
+    // parses into a classless empty `<p>` after the `<hr>`, which stays
+    // where it is (see normalizeBlockEl).
+    function isBreakParagraphAfter(hr) {
+      const next = hr.nextElementSibling;
+      return (
+        !!next &&
+        TEXT_BLOCK_TAGS.has(next.tagName) &&
+        next.hasAttribute("class") &&
+        !(next.textContent || "").trim() &&
+        !next.querySelector("img")
+      );
+    }
+
     function walk(node, listChain) {
+      const placedEarly = new Set();
       for (const child of Array.from(node.children)) {
+        if (placedEarly.has(child)) continue;
         if (isExplicitPageBreak(child)) {
+          if (isBreakParagraphAfter(child)) {
+            const own = child.nextElementSibling;
+            placedEarly.add(own);
+            placeWithFootnotes(own, listChain);
+          }
           if (pageIndex < pageContainers.length - 1) pageIndex += 1;
           usedHeight = 0;
           continue;
@@ -1949,7 +2308,7 @@
         if (child.tagName === "UL" || child.tagName === "OL") {
           walk(child, [...listChain, child]);
         } else {
-          placeLeaf(child, listChain);
+          placeWithFootnotes(child, listChain);
         }
       }
     }
@@ -2085,12 +2444,44 @@
   // it belongs to so consecutive-line spacing can be attributed to a font.
   function mirrorLinesForPage(containerEl, pageTopPx) {
     const lines = [];
+    const bare = (f) => (f || "").split(",")[0].trim().replace(/^["']|["']$/g, "");
     for (const blockEl of flowBlocksIn(containerEl)) {
+      // A line's top is taken from the runs in the block's own font, the
+      // one inkTopOffsetPx measures, whenever the line has any. A run in
+      // another family starts its rect at *its* font's ascent: a 🡪 in
+      // Noto Sans Symbols (ascent 28px at 18.67px) inside a Lato heading
+      // (ascent 18px) starts 9px above the Lato text on the same baseline.
+      // Taking that rect as the line top and adding Lato's ink offset put
+      // the predicted ink 9px high, so a Common App doc whose page 2 opened
+      // with "Education 🡪 Honors section" got a false 8.04px header shift
+      // and every page from the second sat 7.5px low.
+      // Only the other-font runs' own boxes are set aside, so a line with
+      // none keeps exactly the top it had (a text-less image line too). A
+      // dropdown chip after a label counts as one: its inline-block box
+      // starts ~2px above the label text, measured on 61 chip lines.
+      const ownFamily = bare(resolveMirrorFontFamily((blockEl.dataset.gdtFontKey || "").split("|")[0]));
+      const foreign = [];
+      if (ownFamily) {
+        const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          if (!node.data.trim()) continue;
+          let el = node.parentElement;
+          if (!el || bare(getComputedStyle(el).fontFamily) === ownFamily) continue;
+          const nodeRange = document.createRange();
+          nodeRange.selectNodeContents(node);
+          foreign.push(...nodeRange.getClientRects());
+          for (; el && el !== blockEl && bare(getComputedStyle(el).fontFamily) !== ownFamily; el = el.parentElement) {
+            foreign.push(...el.getClientRects());
+          }
+        }
+      }
+      const isForeign = (r) =>
+        foreign.some((f) => Math.abs(f.top - r.top) < 0.01 && Math.abs(f.left - r.left) < 0.01 && Math.abs(f.bottom - r.bottom) < 0.01);
       const range = document.createRange();
       range.selectNodeContents(blockEl);
       const rects = Array.from(range.getClientRects())
         .filter((r) => r.height > 1)
-        .map((r) => [r.top - pageTopPx, r.bottom - pageTopPx])
+        .map((r) => [r.top - pageTopPx, r.bottom - pageTopPx, !isForeign(r)])
         .sort((a, b) => a[0] - b[0]);
       const merged = [];
       for (const r of rects) {
@@ -2100,9 +2491,10 @@
         if (last && r[0] < last[1] - 1) {
           last[0] = Math.min(last[0], r[0]);
           last[1] = Math.max(last[1], r[1]);
-        } else merged.push([r[0], r[1]]);
+          if (r[2]) last[2] = Math.min(last[2], r[0]);
+        } else merged.push([r[0], r[1], r[2] ? r[0] : Infinity]);
       }
-      for (const m of merged) lines.push({ top: m[0], blockEl });
+      for (const m of merged) lines.push({ top: Number.isFinite(m[2]) ? m[2] : m[0], blockEl });
     }
     return lines.sort((a, b) => a.top - b.top);
   }
@@ -2409,17 +2801,16 @@
     }
   }
 
-  function applyColumnSections(scratch, pxPerPt) {
-    const cols = state.docxColumns;
-    if (!cols || !cols.sections.length) return;
-    const nodes = extractBlockNodes(scratch);
+  // HTML block index -> docx paragraph index (-1 where none matched), by
+  // text in order; null when too few match for the mapping to be trusted.
+  function matchDocxParagraphs(nodes, texts) {
     const map = new Array(nodes.length).fill(-1);
     let d = 0;
     let matched = 0;
     nodes.forEach((node, h) => {
       const t = textOfBlock(node).replace(/\s+/g, "");
-      for (let k = d; k < Math.min(cols.texts.length, d + 4); k++) {
-        if (cols.texts[k] === t) {
+      for (let k = d; k < Math.min(texts.length, d + 4); k++) {
+        if (texts[k] === t) {
           map[h] = k;
           d = k + 1;
           matched += 1;
@@ -2427,7 +2818,42 @@
         }
       }
     });
-    if (!nodes.length || matched < nodes.length * 0.8) return;
+    return nodes.length && matched >= nodes.length * 0.8 ? map : null;
+  }
+
+  // Puts the docx's spacing (see parseDocxParagraphSpacing) where the HTML
+  // export's can't be trusted, for collapseAdjacentBlockSpacing to use:
+  // list items get the docx's before/after outright (and are then exempt
+  // from the "nothing between two list items" fallback), and a bordered
+  // paragraph gets its outside spacing as data, since its own padding is
+  // the border's.
+  function applyDocxSpacing(scratch, pxPerPt) {
+    const cols = state.docxColumns;
+    if (!cols || !cols.spacing) return;
+    const nodes = extractBlockNodes(scratch);
+    const map = matchDocxParagraphs(nodes, cols.texts);
+    if (!map) return;
+    nodes.forEach((node, h) => {
+      const sp = map[h] >= 0 ? cols.spacing[map[h]] : null;
+      if (!sp || node.closest("table")) return;
+      const px = (pt) => (pt * pxPerPt).toFixed(3);
+      if (node.tagName === "LI") {
+        node.style.paddingTop = `${px(sp.before)}px`;
+        node.style.paddingBottom = `${px(sp.after)}px`;
+        node.dataset.gdtDocxSpacing = "1";
+      }
+      const cs = getComputedStyle(node);
+      if (cs.borderBottomStyle !== "none" && parseFloat(cs.borderBottomWidth) > 0) node.dataset.gdtOuterAfter = px(sp.after);
+      if (cs.borderTopStyle !== "none" && parseFloat(cs.borderTopWidth) > 0) node.dataset.gdtOuterBefore = px(sp.before);
+    });
+  }
+
+  function applyColumnSections(scratch, pxPerPt) {
+    const cols = state.docxColumns;
+    if (!cols || !cols.sections.length) return;
+    const nodes = extractBlockNodes(scratch);
+    const map = matchDocxParagraphs(nodes, cols.texts);
+    if (!map) return;
 
     for (const sec of cols.sections) {
       let hStart = -1;
@@ -2525,7 +2951,14 @@
         // real doc: chip lines at a 22.5px pitch). An inline-block with
         // that line height stretches the line box the same way; without it
         // every chip line lost ~2px and a page of them drifted 25px.
+        // !important because normalizeBlockEl gives a run in a different
+        // font from the paragraph's dominant one its own inline line height,
+        // and a chip after a label ("Timing of participation: All Year") is
+        // such a run: 97 of 152 chips on a Common App doc got 19.397px
+        // inline, and their lines came out 20.4px against Docs' 22.5. Kept
+        // off runs inside a real link, which keep their own line height.
         scaledStyle += `\n${sel.join(",")}{display:inline-block;line-height:${(22.5 * z).toFixed(2)}px;padding:0 ${(16 * z).toFixed(2)}px 0 ${(5 * z).toFixed(2)}px;margin-right:${(4 * z).toFixed(2)}px}`;
+        scaledStyle += `\n${sel.map((x) => `${x}:not(a *)`).join(",")}{line-height:${(22.5 * z).toFixed(2)}px !important}`;
         scaledStyle += `\n${sel.map((x) => `a ${x}`).join(",")}{display:inline;line-height:inherit;padding:0;margin:0}`;
       }
     }
@@ -2544,9 +2977,16 @@
     );
 
     const containers = ensurePageContainers(state.mirror, layout.count, state.lastBodyClassAttr || "");
+    // `important`, because the page-box rule above sets the padding with
+    // !important, which beats a plain inline value. Without it the shift
+    // only ever shrank the budget: the body never moved, the next
+    // calibration pass measured the same error again and added it on top
+    // (8.04px a pass, 193px after 24 passes on a Common App doc), and
+    // every page from the second one held 193px less than Docs puts on it.
     containers.forEach((c, i) => {
       const shift = originShiftFor(i);
-      c.style.paddingTop = shift ? `${(contentTopPx + shift).toFixed(2)}px` : "";
+      if (shift) c.style.setProperty("padding-top", `${(contentTopPx + shift).toFixed(2)}px`, "important");
+      else c.style.removeProperty("padding-top");
     });
     containers.forEach((c) => {
       c.innerHTML = "";
@@ -2582,11 +3022,6 @@
       }
       if (!ok) continue;
       table.style.tableLayout = "fixed";
-      // Docs leaves ~1px more below a table than the collapsed-border box
-      // measures: against the real page every answer box was followed by
-      // lines ~1px lower than the mirror put them, and over a page of boxes
-      // (5-6) that put the lines at the foot on the wrong side of the break.
-      table.style.marginBottom = `${TABLE_TRAILING_GAP_PX}px`;
       table.style.width = `${total.toFixed(3)}px`;
       const cells = Array.from(table.querySelectorAll("td, th"));
       cells.forEach((c) => {
@@ -2608,7 +3043,30 @@
         give("Right", "Right");
       });
     }
+    // Docs keeps a row's minimum height (the export's `height:` on the
+    // <tr>) inside the borders, while a collapsed-border CSS row counts half
+    // of each border in it, so every such row came out one border (1px)
+    // short. Measured on a 36.4pt (48.53px) row with 1px borders: Docs'
+    // borders are 50px apart and the next line follows 1px after the bottom
+    // one; the mirror's box was 49.53px. (Answer boxes on a Common App doc
+    // were all rows like this, which is what an earlier blanket 1px gap
+    // under every table was really correcting; on rows without a minimum
+    // height that gap put each following line 1px low, +6px after six
+    // tables.)
+    for (const row of scratch.querySelectorAll("tr")) {
+      const minPx = declaredClassPx(row, scaledStyle, "height");
+      if (!minPx || !row.cells.length) continue;
+      let top = 0;
+      let bottom = 0;
+      for (const cell of row.cells) {
+        const cs = getComputedStyle(cell);
+        top = Math.max(top, parseFloat(cs.borderTopWidth) || 0);
+        bottom = Math.max(bottom, parseFloat(cs.borderBottomWidth) || 0);
+      }
+      row.style.height = `${(minPx + (top + bottom) / 2).toFixed(3)}px`;
+    }
     padTrailingLineBreaks(scratch);
+    applyDocxSpacing(scratch, pxPerPt);
     const flowBlocks = flowBlocksIn(scratch);
     collapseAdjacentBlockSpacing(flowBlocks, Array.from(scratch.querySelectorAll("table")));
     flowBlocks.forEach(normalizeBlockEl);
@@ -2634,8 +3092,41 @@
 
     applyColumnSections(scratch, pxPerPt);
 
+    // A row with a minimum height (the export's `height:` on the <tr>)
+    // comes out a whole pixel tall in Docs, rounded up. On 23 answer boxes
+    // of a Common App doc, all such rows, the real borders were 0.35-1.0px
+    // further apart than the mirror's (49.53 -> 50, 67.13 -> 68,
+    // 137.53 -> 138, 66.38 -> 67), and with a box or two per section the
+    // lines below drifted up to 4px by a page's foot; rounded up, 302 of
+    // 310 caret-paired lines sit within 1px, against 189. A row without one
+    // is NOT rounded: the QA doc's rows (34.73, 34.73, 220.27, 77.93) have
+    // real borders 35, 34.5, 220.5 and 78 apart, and rounding them put
+    // every line below the first table 1.26px low. All heights are read
+    // first, so one row's change can't feed into the next reading.
+    const tableRows = Array.from(scratch.querySelectorAll("tr")).filter((row) =>
+      declaredClassPx(row, scaledStyle, "height")
+    );
+    const rowHeights = tableRows.map((row) => row.getBoundingClientRect().height);
+    tableRows.forEach((row, i) => {
+      const h = rowHeights[i];
+      if (h > 0) row.style.height = `${Math.ceil(h - 0.01)}px`;
+    });
+
+    // Each footnote's height, laid out like a body paragraph (same
+    // stylesheet, width and line-height normalization), then taken out
+    // again before pagination walks the scratch container.
+    const footnoteHeights = new Map();
+    for (const [href, node] of state.lastFootnoteNodes) {
+      const fn = document.importNode(node, true);
+      scratch.appendChild(fn);
+      fn.querySelectorAll(BLOCK_LINE_SELECTOR).forEach(normalizeBlockEl);
+      footnoteHeights.set(href, fn.getBoundingClientRect().height);
+      fn.remove();
+    }
+    const footnotes = { heights: footnoteHeights, separatorPx: FOOTNOTE_SEPARATOR_PT * pxPerPt };
+
     const placementLog = [];
-    paginateBlocks(scratch, containers, printableHeightsPx, placementLog);
+    paginateBlocks(scratch, containers, printableHeightsPx, placementLog, footnotes);
     try {
       host.dataset.gdtPlacementLog = JSON.stringify(placementLog);
     } catch (e) {
@@ -2854,15 +3345,12 @@
   // know or care which fragment any given text node came from.
   function instrumentParagraphMirror(fragments, sentenceTexts) {
     if (!sentenceTexts.length) return;
-    const textNodes = [];
-    for (const frag of fragments) {
-      const walker = document.createTreeWalker(frag, NodeFilter.SHOW_TEXT);
-      let n;
-      while ((n = walker.nextNode())) textNodes.push(n);
-    }
-    if (!textNodes.length) return;
+    // <br>s count as one space each, the same as in leafText.
+    const entries = [];
+    for (const frag of fragments) entries.push(...textEntries(frag));
+    if (!entries.some((e) => e.node.nodeType === Node.TEXT_NODE)) return;
 
-    const fullText = textNodes.map((t) => t.data).join("");
+    const fullText = entries.map((e) => e.text).join("");
     let cursor = 0;
     const ranges = [];
     for (const s of sentenceTexts) {
@@ -2902,9 +3390,12 @@
     // inside it, producing a flat, ordered list of (possibly-split) pieces.
     let offset = 0;
     const pieces = [];
-    for (const node of textNodes) {
+    for (const { node, text } of entries) {
       const localStart = offset;
-      const text = node.data;
+      if (node.nodeType !== Node.TEXT_NODE) {
+        offset += text.length;
+        continue;
+      }
       const boundaries = new Set();
       for (const [s, e] of ranges) {
         if (s > localStart && s < localStart + text.length) boundaries.add(s - localStart);
@@ -3409,13 +3900,13 @@
     }
     setStale(false);
 
-    const { styleText, bodyNode } = parseExportedDocument(html);
+    const { styleText, bodyNode, footnoteTexts, footnoteNodes } = parseExportedDocument(html);
     const blocks = extractBlockNodes(bodyNode);
     const texts = blocks.map(textOfBlock);
     // Layout counts as a change too: the mirror's geometry comes from the
     // export's stylesheet and page-box class (margins, page size, spacing),
     // so a margin edit with identical text must still rebuild the mirror.
-    const signature = [bodyNode.getAttribute("class") || "", styleText, texts.join("\u0001")].join("\u0002");
+    const signature = [bodyNode.getAttribute("class") || "", styleText, texts.join("\u0001"), footnoteTexts.join("\u0001")].join("\u0002");
 
     if (signature === state.lastSignature) {
       // Margins only live in the docx, so look there even when the body is
@@ -3433,10 +3924,12 @@
       }
     }
 
+    state.footnoteTexts = footnoteTexts;
     state.paragraphs = composeParagraphs(bodyParagraphs);
     state.lastSignature = signature;
     state.lastTabId = getTabId();
     state.lastBodyNode = bodyNode;
+    state.lastFootnoteNodes = footnoteNodes;
     state.lastStyleText = styleText;
     state.lastBodyClassAttr = bodyNode.getAttribute("class") || "";
 
@@ -3484,7 +3977,7 @@
     if (!texts) return; // throttled or backing off; nothing to do
     const signature = JSON.stringify(texts);
     if (signature === state.headerFooterSignature) return;
-    const columnsOf = (c) => JSON.stringify((c && c.sections) || []);
+    const columnsOf = (c) => JSON.stringify([(c && c.sections) || [], (c && c.spacing) || []]);
     const pageChanged =
       JSON.stringify(texts.page) !== JSON.stringify(state.docxPage) ||
       columnsOf(texts.columns) !== columnsOf(state.docxColumns) ||
