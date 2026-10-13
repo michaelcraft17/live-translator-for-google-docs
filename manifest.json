@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Live Translator for Google Docs",
-  "version": "1.0.78",
+  "version": "1.0.83",
   "description": "Side-by-side live translation for Google Docs, with click-to-sync highlighting between the document and the translation.",
   "icons": {
     "16": "icons/icon16.png",
@@ -39,6 +39,17 @@
         "https://docs.google.com/document/*"
       ],
       "js": [
+        "content/font-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://docs.google.com/document/*"
+      ],
+      "js": [
+        "content/brotli.js",
         "content/content.js"
       ],
       "css": [

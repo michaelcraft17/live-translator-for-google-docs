@@ -132,6 +132,22 @@ and only re-lays out for a genuine window resize.
   Docs. The line had been 3.35px high; it is −0.85 now. A paragraph whose end
   mark alone is bigger is not affected (measured: it sits where its text
   puts it).
+- **A font's line height comes from the font file Docs loaded, not from Chrome.** Docs' caret height for Roboto at 14.667px is 17.6px (1.2000em); Chrome lays the same face out at 1.1715em (17.18px), so every Roboto line was ~0.4px short and p3 of the QA doc drifted −0.9…−1.85px. Roboto's OS/2 win metrics give (1946+512)/2048 = 1.2002em, its hhea 1.1719em, USE_TYPO_METRICS off. Docs takes max(hhea, win) unless USE_TYPO_METRICS is set (then typo). `content/font-hook.js` (MAIN world, `document_start`) lists the `FontFace` sources Docs registers (`filesystem:` woff2 files), the content script reads them with XHR, unpacks the brotli stream with the bundled `content/brotli.js` (npm `brotli`, MIT) and takes head/hhea/OS/2. Falls back to Chrome's measurement when a font can't be read. Calibration still overrides it.
+- **A run in another font gets Docs' room above its baseline, not CSS's.**
+  Docs puts a font's line gap above its ascent and all the leading below;
+  CSS splits the leading around the run's own box, and the block's `top`
+  shift only undoes the block font's half. A tall fallback run therefore
+  dropped its line by (run half-leading − block half-leading): the
+  "Education 🡪 Honors" line, with the arrow in Noto Sans Symbols (content
+  38.0px, spaced 44.01px, half-leading 3.00 against Lato's 1.68), read
+  +1.32 by ink. Such a run's `line-height` is now `2·natural − content +
+  2·(block shift)`, which puts exactly Docs' room above its baseline, and a
+  top-aligned zero-width `::before`/`::after` holds the line at the
+  height it had before (the union of the run's box and the block font's
+  strut), so only the baseline moves. Tested live first: the line read −0.18
+  and the block stayed 44.01px. Holding it at the run's spaced height
+  instead made the five Arial paragraphs with a Lato full stop 0.27px short
+  and moved p9 by −0.26, so the strut uses the old union (17.867px there).
 - **A calibrated header shift really moves the body.** It was set as a
   plain inline `padding-top`, which the page-box rule's `!important`
   padding overrode, so the body never moved; each calibration pass measured
