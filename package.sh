@@ -16,7 +16,9 @@ mkdir -p dist
 zip -r -q "$out" \
   manifest.json \
   background.js \
+  content/brotli.js \
   content/content.js \
+  content/font-hook.js \
   content/content.css \
   popup/popup.html \
   popup/popup.js \

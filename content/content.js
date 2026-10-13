@@ -1260,10 +1260,167 @@
     });
   }
 
+  // --- Docs' own line height per font, read from the font files -----------
+  //
+  // Docs sizes a line from the font's tables, not from what Chrome reports.
+  // Measured on the QA doc (Docs' caret height at 14.667px): Roboto 17.6px
+  // = 1.2000em, while Chrome lays the same face out at 1.1715em (17.18px).
+  // The font explains both: Roboto's OS/2 usWinAscent+usWinDescent is
+  // (1946+512)/2048 = 1.2002em, its hhea ascent+descent+lineGap is
+  // (1900+500+0)/2048 = 1.1719em, and USE_TYPO_METRICS is off. Chrome on
+  // macOS uses hhea; Docs takes the larger of hhea and win unless the font
+  // sets USE_TYPO_METRICS, then it uses the typo metrics. The same rule
+  // reproduces the caret heights of Lato 17.59, Times 16.86, Georgia 16.66,
+  // Courier 16.61, Merriweather 18.43 and Comic Neue 16.86, but only Roboto
+  // has win > hhea, so it is the one case that rests on this branch.
+  //
+  // Docs registers the faces with `new FontFace(name, "url(filesystem:...)")`
+  // and no stylesheet rule, so the only way to see the sources is the
+  // font-hook.js MAIN-world probe, which lists them on the root element.
+  // Same-origin XHR can read those filesystem: URLs (fetch cannot).
+  const docsFontRatios = new Map();
+  const docsFontLoads = new Map();
+  // The 63 known tags of the woff2 directory, in spec order. Four-letter
+  // tags like "cvt " carry their trailing space.
+  const WOFF2_TAGS = [
+    "cmap", "head", "hhea", "hmtx", "maxp", "name", "OS/2", "post", "cvt ", "fpgm", "glyf", "loca", "prep",
+    "CFF ", "VORG", "EBDT", "EBLC", "gasp", "hdmx", "kern", "LTSH", "PCLT", "VDMX", "vhea", "vmtx", "BASE",
+    "GDEF", "GPOS", "GSUB", "EBSC", "JSTF", "MATH", "CBDT", "CBLC", "COLR", "CPAL", "SVG ", "sbix", "acnt",
+    "avar", "bdat", "bloc", "bsln", "cvar", "fdsc", "feat", "fmtx", "fvar", "gvar", "hsty", "just", "lcar",
+    "mort", "morx", "opbd", "prop", "trak", "Zapf", "Silf", "Glat", "Gloc", "Feat", "Sill",
+  ];
+
+  // Table offsets/lengths of a plain sfnt, or of a woff2 once its brotli
+  // stream is unpacked. Returns { tables: {tag: DataView} } or null.
+  function readFontTables(bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const tag4 = (o) => String.fromCharCode(bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]);
+    const sig = tag4(0);
+    const tables = {};
+    if (sig === "wOF2") {
+      const n = dv.getUint16(12);
+      const compressedSize = dv.getUint32(20);
+      let p = 48;
+      const base128 = () => {
+        let v = 0;
+        for (let i = 0; i < 5; i++) {
+          const b = bytes[p++];
+          v = v * 128 + (b & 127);
+          if (!(b & 128)) return v;
+        }
+        return v;
+      };
+      const entries = [];
+      for (let i = 0; i < n; i++) {
+        const flags = bytes[p++];
+        const idx = flags & 63;
+        const tag = idx === 63 ? tag4((p += 4) - 4) : WOFF2_TAGS[idx];
+        const version = flags >> 6;
+        const orig = base128();
+        const transformed = tag === "glyf" || tag === "loca" ? version === 0 : version !== 0;
+        entries.push({ tag, length: transformed ? base128() : orig });
+      }
+      if (typeof GDTBrotli !== "function") return null;
+      const data = GDTBrotli(bytes.subarray(p, p + compressedSize));
+      let off = 0;
+      for (const { tag, length } of entries) {
+        tables[tag] = new DataView(data.buffer, data.byteOffset + off, length);
+        off += length;
+      }
+      return { tables };
+    }
+    if (sig === "\0\x01\0\0" || sig === "OTTO" || sig === "true") {
+      const n = dv.getUint16(4);
+      for (let i = 0; i < n; i++) {
+        const o = 12 + i * 16;
+        tables[tag4(o)] = new DataView(bytes.buffer, bytes.byteOffset + dv.getUint32(o + 8), dv.getUint32(o + 12));
+      }
+      return { tables };
+    }
+    return null;
+  }
+
+  // Docs' line height, in em, for the font in `bytes`; 0 when unreadable.
+  function docsLineHeightRatio(bytes) {
+    const font = readFontTables(bytes);
+    if (!font) return 0;
+    const { head, hhea, "OS/2": os2 } = font.tables;
+    if (!head || !hhea) return 0;
+    const upm = head.getUint16(18);
+    if (!upm) return 0;
+    const hheaTotal = hhea.getInt16(4) - hhea.getInt16(6) + hhea.getInt16(8);
+    if (!os2 || os2.byteLength < 78) return hheaTotal / upm;
+    if (os2.getUint16(62) & 128) {
+      return (os2.getInt16(68) - os2.getInt16(70) + os2.getInt16(72)) / upm;
+    }
+    return Math.max(hheaTotal, os2.getUint16(74) + os2.getUint16(76)) / upm;
+  }
+
+  function docsFaceKey(family, weight, style) {
+    const bare = String(family || "")
+      .split(",")[0]
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .replace(/^docs-/i, "");
+    const w = weight === "bold" || parseInt(weight, 10) >= 600 ? "700" : "400";
+    return `${bare}|${w}|${/italic|oblique/.test(style || "") ? "italic" : "normal"}`;
+  }
+
+  function readFontUrl(url) {
+    return new Promise((resolve) => {
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", url);
+        xhr.responseType = "arraybuffer";
+        xhr.onload = () => resolve(xhr.status === 200 || xhr.status === 0 ? new Uint8Array(xhr.response) : null);
+        xhr.onerror = () => resolve(null);
+        xhr.send();
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  // Reads every face Docs has registered and not yet been read. Resolves to
+  // true when a new ratio differs from the one the mirror already measured.
+  async function loadDocsFontRatios() {
+    let faces;
+    try {
+      faces = JSON.parse(document.documentElement.dataset.gdtFontLog || "[]");
+    } catch (e) {
+      return false;
+    }
+    const pending = [];
+    for (const f of faces) {
+      if (f.kind !== "css" || /--Menu$/.test(f.family)) continue;
+      const url = (f.ref || "").match(/url\((filesystem:[^)]+)\)/);
+      if (!url) continue;
+      const key = docsFaceKey(f.family, f.weight, f.style);
+      if (docsFontRatios.has(key) || docsFontLoads.has(key)) continue;
+      const job = readFontUrl(url[1]).then((bytes) => {
+        let ratio = 0;
+        try {
+          ratio = bytes ? docsLineHeightRatio(bytes) : 0;
+        } catch (e) {
+          ratio = 0;
+        }
+        if (ratio > 0.5 && ratio < 3) docsFontRatios.set(key, ratio);
+        return ratio;
+      });
+      docsFontLoads.set(key, job);
+      pending.push(job);
+    }
+    const got = await Promise.all(pending);
+    if (pending.length) log("docs font ratios read:", docsFontRatios.size, "faces");
+    return got.some((r) => r > 0);
+  }
+
   function measureNaturalLineHeightPx(fontFamily, fontSizePx, fontWeight, fontStyle) {
     const key = fontKeyOf(fontFamily, fontWeight, fontStyle);
     const calibrated = calibratedNaturalRatios.get(key);
     if (calibrated !== undefined) return calibrated * fontSizePx;
+    const fromFont = docsFontRatios.get(docsFaceKey(fontFamily, fontWeight, fontStyle));
+    if (fromFont) return fromFont * fontSizePx;
     let ratio = naturalLineHeightRatioCache.get(key);
     if (ratio === undefined) {
       const probe = document.createElement("span");
@@ -1306,6 +1463,34 @@
       ratio = rect ? rect.height / NATURAL_LH_PROBE_PX : 0;
       box.remove();
       contentAreaRatioCache.set(key, ratio);
+    }
+    return ratio * fontSizePx;
+  }
+
+  // A font's ascent as the browser lays it out (baseline to the top of the
+  // content area), probed at the same large size.
+  const ascentRatioCache = new Map();
+  function measureAscentPx(fontFamily, fontSizePx, fontWeight, fontStyle) {
+    const key = fontKeyOf(fontFamily, fontWeight, fontStyle);
+    let ratio = ascentRatioCache.get(key);
+    if (ratio === undefined) {
+      const box = document.createElement("div");
+      box.style.cssText = "position:absolute;visibility:hidden;white-space:nowrap;line-height:normal";
+      const probe = document.createElement("span");
+      probe.style.fontFamily = resolveMirrorFontFamily(fontFamily);
+      probe.style.fontSize = `${NATURAL_LH_PROBE_PX}px`;
+      probe.style.fontWeight = fontWeight || "normal";
+      probe.style.fontStyle = fontStyle || "normal";
+      probe.textContent = "Mg";
+      const marker = document.createElement("span");
+      marker.style.cssText = "display:inline-block;width:0;height:0;vertical-align:baseline";
+      probe.appendChild(marker);
+      box.appendChild(probe);
+      document.body.appendChild(box);
+      const rect = probe.getClientRects()[0];
+      ratio = rect ? (marker.getBoundingClientRect().top - rect.top) / NATURAL_LH_PROBE_PX : 0;
+      box.remove();
+      ascentRatioCache.set(key, ratio);
     }
     return ratio * fontSizePx;
   }
@@ -1497,6 +1682,12 @@
     // height instead, the 14pt span left that line at 20.4px.
     const origFamily = cs.fontFamily;
     const runKey = fontKeyOf(run.fontFamily, run.fontWeight, run.fontStyle);
+    // What the block's `top` (set below) moves every line up by: half the
+    // block font's leading, less half its line gap. A run in another font
+    // needs the same amount of room above its baseline, see the loop.
+    const contentArea = measureContentAreaPx(run.fontFamily, run.fontSizePx, run.fontWeight, run.fontStyle);
+    const halfGap = contentArea ? Math.max(0, natural - contentArea) / 2 : 0;
+    const blockShift = (lineHeightPx - natural) / 2 - halfGap;
     for (const el of blockEl.querySelectorAll("*")) {
       const ecs = getComputedStyle(el);
       if (Math.abs(parseFloat(ecs.fontSize) - blockFontSizePx) < 0.01) el.style.fontSize = `${blockFontSizePx}px`;
@@ -1518,7 +1709,43 @@
       if (!ownText || !sizePx) continue;
       if (Math.abs(sizePx - run.fontSizePx) < FONT_SIZE_TIE_EPSILON_PX && fontKeyOf(ecs.fontFamily, ecs.fontWeight, ecs.fontStyle) === runKey) continue;
       const own = measureNaturalLineHeightPx(ecs.fontFamily, sizePx, ecs.fontWeight, ecs.fontStyle);
-      if (own) el.style.lineHeight = `${(own * ratio).toFixed(3)}px`;
+      if (!own) continue;
+      // Docs puts this run's line gap above its ascent and all its leading
+      // below, like the block's font; CSS splits the leading half and half
+      // around the run's own box, and the block's `top` below only undoes
+      // the *block* font's half. For a run whose metrics differ that left
+      // its line low by (run half-leading - block half-leading): on the
+      // Common App doc's "Education 🡪 Honors" line, the arrow in Noto
+      // Sans Symbols (content 38.0px, line 44.01px) has 3.00px of half-
+      // leading against Lato's 1.68, and the line's text read +1.32 by
+      // ink. Giving the run exactly the room Docs does above its baseline
+      // (its gap plus the block's shift) fixes the position: the line box
+      // is then too short, so a top-aligned strut (rule in rebuildMirror)
+      // holds it at the run's spaced height. The line read -0.18 and the
+      // block stayed 44.01px. For a run with the block font's metrics this
+      // is the old `own * ratio`, so nothing else moves.
+      const ownContent = measureContentAreaPx(ecs.fontFamily, sizePx, ecs.fontWeight, ecs.fontStyle);
+      const spaced = own * ratio;
+      const ownAscent = measureAscentPx(ecs.fontFamily, sizePx, ecs.fontWeight, ecs.fontStyle);
+      const blockAscent = measureAscentPx(run.fontFamily, run.fontSizePx, run.fontWeight, run.fontStyle);
+      if (!ownContent || !contentArea || !ownAscent || !blockAscent) {
+        el.style.lineHeight = `${spaced.toFixed(3)}px`;
+        continue;
+      }
+      el.style.lineHeight = `${(2 * own - ownContent + 2 * blockShift).toFixed(3)}px`;
+      // The strut holds the line at what CSS gave it before this change: the
+      // union of this run's box and the block font's strut, each with its
+      // leading split half and half. That total was right (an Arial
+      // paragraph's Lato full stop: 17.867px, and holding the line at the
+      // run's spaced 17.6 instead made the block 0.27px short and shifted
+      // p9 of a Common App doc by -0.26), only where the baseline sat was not.
+      const ownHalf = (spaced - ownContent) / 2;
+      const blockHalf = (lineHeightPx - contentArea) / 2;
+      const lineTotal =
+        Math.max(ownAscent + ownHalf, blockAscent + blockHalf) +
+        Math.max(ownContent - ownAscent + ownHalf, contentArea - blockAscent + blockHalf);
+      el.dataset.gdtRunLh = "1";
+      el.style.setProperty("--gdt-run-lh", `${lineTotal.toFixed(3)}px`);
     }
     // A page break typed after text (`<p>text<hr page-break/></p>`, which
     // parses into this block followed by the <hr>) is a character on the
@@ -1587,9 +1814,7 @@
     // 1.9px high. With the half gap added, Calibri's lines on the QA doc's
     // first page measure -0.26 to +0.57 by ink and the 36-72pt Arial lines
     // -0.2 to -0.36. Lato has no gap, so its documents don't move.
-    const contentArea = measureContentAreaPx(run.fontFamily, run.fontSizePx, run.fontWeight, run.fontStyle);
-    const halfGap = contentArea ? Math.max(0, natural - contentArea) / 2 : 0;
-    blockEl.style.top = `${(-(lineHeightPx - natural) / 2 + halfGap).toFixed(3)}px`;
+    blockEl.style.top = `${(-blockShift).toFixed(3)}px`;
 
     // An inline image sits on the baseline, and Docs gives its line the
     // text's full below-baseline part (line height minus ascent, i.e. all
@@ -3017,6 +3242,12 @@
     scaledStyle +=
       '\n[data-gdt-break-glyph]::after{content:"\\200B";font-family:var(--gdt-break-family);font-size:var(--gdt-break-size);' +
       "font-weight:var(--gdt-break-weight);font-style:var(--gdt-break-style);line-height:var(--gdt-break-lh)}";
+    // A differently-fonted run's strut (see normalizeBlockEl): a zero-width
+    // box aligned to the line's top, which keeps the line at the run's
+    // spaced height without moving the baseline.
+    scaledStyle +=
+      "\n[data-gdt-run-lh]::before,[data-gdt-run-lh]::after{content:\"\";display:inline-block;width:0;" +
+      "height:var(--gdt-run-lh);vertical-align:top}";
     styleEl.textContent = scaledStyle;
 
     // Every page in a Docs document has the same box, so one printable
@@ -3322,8 +3553,8 @@
   // downloading, for the life of the page — not just once at startup — so
   // this also covers a font Docs registers later. Debounced because Docs
   // can add several faces in quick succession, each firing its own event.
-  function invalidateFontMetricsAndRebuild() {
-    if (!naturalLineHeightRatioCache.size && !calibratedNaturalRatios.size) return;
+  function invalidateFontMetricsAndRebuild(force) {
+    if (!force && !naturalLineHeightRatioCache.size && !calibratedNaturalRatios.size) return;
     naturalLineHeightRatioCache.clear();
     calibratedNaturalRatios.clear();
     if (!state.lastBodyNode) return;
@@ -4346,13 +4577,21 @@
     createFloatingButton();
     setEnabled(state.enabled);
 
+    // Before the first mirror, so its line heights start from Docs' own.
+    await loadDocsFontRatios();
     await refreshFromDoc();
     setupScrollSync();
 
     // See invalidateFontMetricsAndRebuild's own note: catches a webfont
     // that was still downloading at the measurements above.
     if (document.fonts) {
-      document.fonts.addEventListener("loadingdone", debounce(invalidateFontMetricsAndRebuild, 300));
+      document.fonts.addEventListener(
+        "loadingdone",
+        debounce(async () => {
+          // A face registered after startup changes nothing until read.
+          invalidateFontMetricsAndRebuild(await loadDocsFontRatios());
+        }, 300)
+      );
     }
 
     document.addEventListener("click", onOriginalClick, true);
