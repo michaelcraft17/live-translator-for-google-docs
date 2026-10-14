@@ -43,6 +43,10 @@ button {
   font-size: 13px;
 }
 
+button + button {
+  margin-top: 8px;
+}
+
 .hint {
   font-size: 11px;
   color: #666;
